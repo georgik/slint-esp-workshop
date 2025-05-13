@@ -4,6 +4,8 @@ slint::include_modules!();
 
 use log::info;
 
+struct WifiNetwork; // Dummy struct, remove this when Slint implementation is done
+
 type Wifi = esp_idf_svc::wifi::BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>;
 
 pub struct Model {
