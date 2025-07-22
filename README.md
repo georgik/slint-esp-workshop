@@ -2,11 +2,25 @@
 
 This is a Rust Slint Workshop template supporting multiple ESP32-S3 boards using a no_std bare-metal implementation.
 
-## Supported Boards
+## Variants and Supported Boards
+
+This workshop supports two main variants: `std` and `no_std`.
 
 - **ESP32-S3-BOX-3** (default)
 - **ESoPE-SLD-C-W-S3**
 - **ESP32-S3-LCD-EV-BOARD**
+
+### Difference between `std` and `no_std`
+
+- **`std` (Standard Library) Variant**
+  - Uses the Rust Standard Library.
+  - Suitable for applications needing more extensive feature support.
+  - Easier debugging and richer ecosystem support.
+
+- **`no_std` (No Standard Library) Variant**
+  - Excludes the Rust Standard Library.
+  - Optimized for embedded systems with constrained resources.
+  - Direct access to hardware with minimal overhead.
 
 ## Switching Boards
 
@@ -41,8 +55,9 @@ Install the Slint extension from the extensions marketplace.
 
 ## Repository structure
 
+- `esp32-s3-std` - **std** application code using the Rust Standard Library for ESP32-S3 boards.
+- `esp32-s3-box-3-no_std` - **no_std** bare-metal application code for ESP32-S3 boards using esp-hal 1.0.0.beta.1.
 - `winit` - Application code for `winit` based platforms, e.g. desktop environments.
-- `esp32` - **no_std** bare-metal application code for ESP32-S3 boards using esp-hal 1.0.0.beta.1.
 - `ui` - Shared Slint code for the UI.
 - `model` - Crate with shared Rust code for the ESP32 and desktop applications (no_std compatible).
 
@@ -54,32 +69,51 @@ Install the Slint extension from the extensions marketplace.
 - **WiFi ready** - Stub implementation ready for WiFi functionality
 - **Embassy async runtime** - Modern async/await support for embedded
 
-## Environment Setup for ESP32-S3 (no_std Bare-Metal)
+## Building Instructions
 
-To build the application for ESP32-S3 boards using no_std bare-metal, switch into the `esp32` directory.
+### Building the `std` Variant
+
+The `esp32-s3-std` directory contains the code for projects utilizing the Rust Standard Library:
+
+```sh
+cd esp32-s3-std
+cargo run --release
+```
+
+For different board configurations, you can use features as needed (check the Cargo.toml for available features).
+
+### Building the `no_std` Variant
+
+To build the application for ESP32-S3 boards using no_std bare-metal, switch into the `esp32-s3-box-3-no_std` directory:
+
+```sh
+cd esp32-s3-box-3-no_std
+```
 
 Make sure to install the required Rust components for the ESP32-S3 target:
 
 ```sh
 rustup target add xtensa-esp32s3-none-elf
-```
-
-You should also have `espflash` installed for flashing the device:
-
-```sh
 cargo install espflash
 ```
 
-Once set up, build the project:
+Build and flash the project (the `.cargo/config.toml` configures `espflash` as runner):
 
 ```sh
-cargo build --release
+cargo run --release
 ```
 
-Flash the application using:
+For different board configurations:
 
 ```sh
-cargo espflash --release --chip esp32s3
+# Default (esp32-s3-box-3)
+cargo run --release
+
+# ESoPE board
+cargo run --release --features esope-sld-c-w-s3 --no-default-features
+
+# LCD-EV board
+cargo run --release --features esp32-s3-lcd-ev-board --no-default-features
 ```
 
 ## No_std Implementation Details
@@ -134,17 +168,18 @@ espup install # Installs the toolchain. Only has to be done once.
 
 #### 4. Build and run the project
 
-Change directory to the `esp32` folder and build the project:
+Change directory to the appropriate variant folder and build the project:
 
+For `no_std` variant:
 ```sh
-cd esp32
-cargo build --release
+cd esp32-s3-box-3-no_std
+cargo run --release
 ```
 
-Flash the application to the device:
-
+For `std` variant:
 ```sh
-cargo espflash --release
+cd esp32-s3-std
+cargo run --release
 ```
 
 ### Windows (WSL2)
@@ -233,7 +268,7 @@ The list in the console output must contain:
 Bus 001 Device 003: ID 303a:1001 Espressif USB JTAG/serial debug unit
 ```
 
-Now, your device can be flashed and you can run your application via `cargo espflash --release`.
+Now, your device can be flashed and you can run your application via `cargo run --release`.
 
 ## Current UI Features
 
