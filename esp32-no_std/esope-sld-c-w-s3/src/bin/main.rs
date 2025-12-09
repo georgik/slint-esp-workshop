@@ -16,6 +16,8 @@ use alloc::vec;
 use core::alloc::Layout;
 use core::cell::RefCell;
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
 // WiFi imports
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::mutex::Mutex;
