@@ -21,9 +21,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // WiFi imports
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::mutex::Mutex;
-use esp_hal::rng::Rng;
-use esp_wifi::EspWifiController;
-use esp_wifi::wifi::{AccessPointInfo, ClientConfiguration, Configuration, WifiController};
+use esp_radio::wifi::{
+    AccessPointInfo, ClientConfig, ModeConfig, ScanConfig, WifiController, WifiError,
+};
 
 use eeprom24x::{Eeprom24x, SlaveAddr};
 use embedded_hal_bus::i2c::RefCellDevice;
@@ -55,7 +55,7 @@ use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
-use esp_hal_embassy::Executor;
+use esp_rtos::embassy::Executor;
 use static_cell::StaticCell;
 
 #[panic_handler]
@@ -124,8 +124,8 @@ impl slint::platform::Platform for EspBackend {
 
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         info!("=== Starting Main Event Loop ===");
-        let heap_at_start = esp_alloc::HEAP.used();
-        info!("Heap usage at event loop start: {} bytes", heap_at_start);
+        // Heap tracking disabled due to esp-rtos allocator
+        info!("Heap usage tracking disabled");
 
         let peripherals = self
             .peripherals
@@ -375,8 +375,9 @@ impl slint::platform::Platform for EspBackend {
         let timg1 = TimerGroup::new(peripherals.TIMG1);
         let timer1: AnyTimer = timg1.timer0.into();
 
-        info!("Initializing Embassy with dual timers for multicore support...");
-        esp_hal_embassy::init([timer0, timer1]);
+        // Note: This dual-core Embassy initialization is not used in main execution path
+        // info!("Initializing Embassy with dual timers for multicore support...");
+        // esp_hal_embassy::init([timer0, timer1]);
 
         let heap_after_embassy = esp_alloc::HEAP.used();
         info!(
@@ -554,13 +555,9 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     info!("=== WiFi scan task started ====");
 
     // Start WiFi
-    let client_config = Configuration::Client(ClientConfiguration {
-        ssid: String::new(),
-        password: String::new(),
-        ..Default::default()
-    });
+    let client_config = ModeConfig::Client(ClientConfig::default());
 
-    match wifi_controller.set_configuration(&client_config) {
+    match wifi_controller.set_config(&client_config) {
         Ok(_) => info!("WiFi configuration set successfully"),
         Err(e) => info!("Failed to set WiFi configuration: {:?}", e),
     }
@@ -576,7 +573,8 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     loop {
         info!("Performing WiFi scan...");
 
-        match wifi_controller.scan_n_async(10).await {
+        let scan_config = ScanConfig::default().with_max(10);
+        match wifi_controller.scan_with_config_async(scan_config).await {
             Ok(results) => {
                 info!("Found {} networks:", results.len());
                 for (i, ap) in results.iter().enumerate() {
@@ -657,17 +655,20 @@ pub fn init() {
 // Use Slint build compilation helper
 slint::include_modules!();
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     // Initialize peripherals first.
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
     // Initialize BOTH heap allocators - WiFi first in internal RAM, then PSRAM for GUI
-    // Step 1: Initialize internal RAM heap for WiFi (must be first)
     esp_alloc::heap_allocator!(size: 180 * 1024);
-
-    // Step 2: Initialize PSRAM heap for GUI and other data
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+
+    // Initialize embassy timer BEFORE esp_radio::init()
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let timer0: AnyTimer = timg0.timer0.into();
+    esp_rtos::start(timer0);
+    info!("Embassy timer initialized");
 
     // Initialize logger
     init_logger_from_env();
@@ -675,25 +676,18 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Starting Slint ESP32 ESoPe Board WiFi Workshop");
 
-    // Initialize WiFi directly in main function
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let rng = Rng::new(peripherals.RNG);
-
+    // Initialize WiFi AFTER embassy is started
     info!("Initializing WiFi...");
-    let esp_wifi_ctrl = &*mk_static!(
-        EspWifiController<'static>,
-        esp_wifi::init(timg0.timer0, rng.clone()).expect("Failed to initialize WiFi")
+    let esp_radio_ctrl = &*mk_static!(
+        esp_radio::Controller<'static>,
+        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
     info!("WiFi controller initialized");
 
-    let (wifi_controller, _interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI)
-        .expect("Failed to create WiFi interface");
+    let (wifi_controller, _interfaces) =
+        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default())
+            .expect("Failed to create WiFi interface");
     info!("WiFi interface created");
-
-    // Initialize embassy timer for task scheduling BEFORE spawning tasks
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init(timg1.timer0);
-    info!("Embassy timer initialized");
 
     // Create custom Slint window and backend
     let window = slint::platform::software_renderer::MinimalSoftwareWindow::new(
