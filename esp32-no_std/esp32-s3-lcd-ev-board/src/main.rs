@@ -10,6 +10,8 @@ use alloc::vec;
 use core::panic::PanicInfo;
 use log::{error, info};
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
 // WiFi imports
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -24,7 +26,6 @@ use esp_wifi::wifi::{AccessPointInfo, ClientConfiguration, Configuration, WifiCo
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::i2c::master::{Config as I2cConfig, Error as I2cError, I2c};
 use esp_hal::time::Rate;
 use esp_println::logger::init_logger_from_env;
 
@@ -41,9 +42,8 @@ use esp_hal::lcd_cam::{
 };
 
 // Slint platform imports
+use slint::PhysicalSize;
 use slint::platform::software_renderer::Rgb565Pixel;
-use slint::platform::{PointerEventButton, WindowEvent};
-use slint::{LogicalPosition, PhysicalPosition, PhysicalSize};
 
 slint::include_modules!();
 
@@ -132,24 +132,24 @@ where
 
 /// TCA9554 I2C I/O Expander for display control
 struct Tca9554 {
-    i2c: I2c<'static, esp_hal::Blocking>,
+    i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
     address: u8,
 }
 
 impl Tca9554 {
-    pub fn new(i2c: I2c<'static, esp_hal::Blocking>) -> Self {
+    pub fn new(i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>) -> Self {
         Self { i2c, address: 0x20 }
     }
 
-    pub fn write_direction_reg(&mut self, value: u8) -> Result<(), I2cError> {
+    pub fn write_direction_reg(&mut self, value: u8) -> Result<(), esp_hal::i2c::master::Error> {
         self.i2c.write(self.address, &[0x03, value])
     }
 
-    pub fn write_output_reg(&mut self, value: u8) -> Result<(), I2cError> {
+    pub fn write_output_reg(&mut self, value: u8) -> Result<(), esp_hal::i2c::master::Error> {
         self.i2c.write(self.address, &[0x01, value])
     }
 
-    pub fn into_i2c(self) -> I2c<'static, esp_hal::Blocking> {
+    pub fn into_i2c(self) -> esp_hal::i2c::master::I2c<'static, esp_hal::Blocking> {
         self.i2c
     }
 }
@@ -518,9 +518,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     info!("Starting Slint ESP32-S3-LCD-EV-Board Workshop");
 
     // Setup I2C for the TCA9554 IO expander and FT5x06 touch controller
-    let i2c = I2c::new(
+    let i2c = esp_hal::i2c::master::I2c::new(
         peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+        esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
     )
     .unwrap()
     .with_sda(peripherals.GPIO47)

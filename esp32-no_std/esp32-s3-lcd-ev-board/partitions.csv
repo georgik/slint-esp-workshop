@@ -1,0 +1,18 @@
+# ESP32-S3-LCD-EV-Board partition table for 8MB flash
+# Name,   Type, SubType, Offset,   Size, Flags
+# Note: ESP32-S3 bootloader typically occupies 0x0000-0x8000 (32KB)
+
+# Factory partition - main application
+factory,  app,  factory, 0x10000,  6M,
+
+# OTA0 partition (for future OTA updates)
+ota_0,    app,  ota_0,    0x610000, 1M,
+
+# WiFi NVS partition for WiFi credentials and settings
+nvs,      data, nvs,      0x710000,  128K,
+
+# PHY init data partition
+phy_init, data, phy,      0x730000,  4K,
+
+# FAT filesystem for assets/resources
+fatfs,    data, fat,      0x731000,  1007K,
