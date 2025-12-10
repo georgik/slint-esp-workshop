@@ -15,17 +15,24 @@ esp_bootloader_esp_idf::esp_app_desc!();
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker};
-use esp_radio::wifi::{
-    AccessPointInfo, ClientConfig, Config, ModeConfig, ScanConfig, WifiController,
-};
+use esp_radio::wifi::{AccessPointInfo, ClientConfig, ModeConfig, ScanConfig, WifiController};
 
 // ESP32 HAL imports
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::dma::ExternalBurstConfig;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::system::Stack;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use static_cell::StaticCell;
+
+// PSRAM configuration imports
+#[cfg(feature = "psram")]
+use esp_hal::psram::{PsramConfig, SpiRamFreq};
 use esp_println::logger::init_logger_from_env;
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
@@ -84,6 +91,14 @@ const LCD_V_RES_USIZE: usize = 480;
 const LCD_BUFFER_SIZE: usize = LCD_H_RES_USIZE * LCD_V_RES_USIZE;
 const FRAME_BYTES: usize = LCD_BUFFER_SIZE * 2; // 2 bytes per RGB565 pixel
 const NUM_DMA_DESC: usize = (FRAME_BYTES + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+// Embassy multicore: allocate app core stack
+static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+
+// PSRAM synchronization signals
+static PSRAM_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static mut PSRAM_BUF_PTR: *mut u8 = core::ptr::null_mut();
+static mut PSRAM_BUF_LEN: usize = 0;
 
 // Place DMA descriptors in DMA-capable RAM
 #[unsafe(link_section = ".dma")]
@@ -347,78 +362,93 @@ async fn auto_wifi_refresh_task(ui_weak: slint::Weak<MainWindow>) {
     }
 }
 
-// Graphics rendering task - handles display output and WiFi UI refresh
+// DMA display task - runs on Core 1, handles pure display output
 #[embassy_executor::task]
-async fn graphics_task(
-    window: Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
-    ui: slint::Weak<MainWindow>,
+async fn dma_display_task(
     mut dpi: esp_hal::lcd_cam::lcd::dpi::Dpi<'static, esp_hal::Blocking>,
     mut dma_tx: esp_hal::dma::DmaTxBuf,
-    pixel_buf: &'static mut [slint::platform::software_renderer::Rgb565Pixel; LCD_BUFFER_SIZE],
 ) {
-    info!("=== Graphics rendering task started ====");
+    info!("[CORE 1] DMA display task started, continuous refresh for RGB display");
 
-    let mut ticker = Ticker::every(Duration::from_millis(100));
+    loop {
+        let frame_bytes = LCD_H_RES_USIZE * LCD_V_RES_USIZE * 2; // RGB565: 2 bytes per pixel
+        dma_tx.set_length(frame_bytes);
+
+        match dpi.send(false, dma_tx) {
+            Ok(xfer) => {
+                let (res, new_dpi, new_dma_tx) = xfer.wait();
+                dpi = new_dpi;
+                dma_tx = new_dma_tx;
+                if let Err(e) = res {
+                    error!("[CORE 1] DMA transfer error: {:?}", e);
+                }
+            }
+            Err((e, new_dpi, new_dma_tx)) => {
+                error!("[CORE 1] DMA send error: {:?}", e);
+                dpi = new_dpi;
+                dma_tx = new_dma_tx;
+            }
+        }
+    }
+}
+
+// Slint rendering task - runs on Core 0, handles UI rendering
+#[embassy_executor::task]
+async fn slint_rendering_task(
+    window: Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
+    ui: slint::Weak<MainWindow>,
+) {
+    info!("[CORE 0] Slint rendering task started");
+
+    // Wait until PSRAM is ready
+    loop {
+        if PSRAM_READY.try_take().is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    info!("[CORE 0] PSRAM ready, starting Slint rendering");
+
+    // SAFETY: PSRAM_BUF_PTR and PSRAM_BUF_LEN are published before this task starts
+    let psram_ptr = unsafe { PSRAM_BUF_PTR };
+    let _psram_len = unsafe { PSRAM_BUF_LEN };
+
+    // Convert to Rgb565 buffer following esope approach
+    let pixel_buf: &mut [slint::platform::software_renderer::Rgb565Pixel; LCD_BUFFER_SIZE] = unsafe {
+        &mut *(psram_ptr as *mut [slint::platform::software_renderer::Rgb565Pixel; LCD_BUFFER_SIZE])
+    };
+
     let mut frame_counter = 0u32;
-
-    info!(
-        "Graphics task initialized with {}x{} buffer",
-        LCD_H_RES, LCD_V_RES
-    );
-
+    let mut ticker = Ticker::every(Duration::from_millis(16)); // ~60fps
     loop {
         // Update Slint timers and animations
         slint::platform::update_timers_and_animations();
-
-        // Request redraw to ensure rendering occurs
-        window.request_redraw();
 
         // Check for new WiFi scan results and trigger UI refresh if available
         if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
             if let Some(ui_strong) = ui.upgrade() {
                 ui_strong.invoke_wifi_refresh();
-                info!("Triggered UI refresh for new WiFi scan results");
+                info!("[CORE 0] Triggered UI refresh for new WiFi scan results");
             }
         }
 
-        // Render the frame if needed
+        // Render the frame if needed (Slint handles dirty tracking internally)
         let rendered = window.draw_if_needed(|renderer| {
             renderer.render(pixel_buf, LCD_H_RES as usize);
         });
 
-        // If a frame was rendered, transfer it via DMA
+        // For RGB displays, ALWAYS refresh the framebuffer to prevent fading
+        // Even when there are no UI changes, we need continuous DMA transfers
         if rendered {
-            // Pack pixels into DMA buffer
-            let dst = dma_tx.as_mut_slice();
-            for (i, px) in pixel_buf.iter().enumerate() {
-                let [lo, hi] = px.0.to_le_bytes();
-                dst[2 * i] = lo;
-                dst[2 * i + 1] = hi;
-            }
-
-            // One-shot DMA transfer of the full frame
-            match dpi.send(false, dma_tx) {
-                Ok(xfer) => {
-                    let (res, dpi2, tx2) = xfer.wait();
-                    dpi = dpi2;
-                    dma_tx = tx2;
-                    if let Err(e) = res {
-                        error!("DMA error: {:?}", e);
-                    }
-                }
-                Err((e, dpi2, tx2)) => {
-                    error!("DMA send error: {:?}", e);
-                    dpi = dpi2;
-                    dma_tx = tx2;
-                }
-            }
-
+            // UI changed - frame data is already in pixel_buf
             if frame_counter % 60 == 0 {
                 info!(
-                    "Frame {} rendered and displayed on ESP32-S3-LCD-EV-Board",
+                    "[CORE 0] Frame {} rendered and ready for DMA transfer",
                     frame_counter
                 );
             }
+        } else {
+            // No UI changes - DMA will still refresh with existing pixel buffer content
         }
 
         frame_counter = frame_counter.wrapping_add(1);
@@ -427,7 +457,7 @@ async fn graphics_task(
         if frame_counter % 300 == 0 {
             // Every ~5 seconds at 60fps
             info!(
-                "Graphics: Frame {}, ESP32-S3-LCD-EV-Board display active",
+                "[CORE 0] Slint: Frame {}, ESP32-S3-LCD-EV-Board rendering active",
                 frame_counter
             );
         }
@@ -505,9 +535,24 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
 
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
-    // Initialize peripherals first
+    // Initialize peripherals first with optimized PSRAM configuration
+    #[cfg(feature = "psram")]
+    let config = esp_hal::Config::default()
+        .with_cpu_clock(CpuClock::max())
+        .with_psram(PsramConfig {
+            ram_frequency: SpiRamFreq::Freq120m,
+            ..Default::default()
+        });
+
+    #[cfg(not(feature = "psram"))]
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+
     let peripherals = esp_hal::init(config);
+
+    #[cfg(feature = "psram")]
+    info!("ESP32-S3 initialized with 120MHz PSRAM frequency");
+    #[cfg(not(feature = "psram"))]
+    info!("ESP32-S3 initialized (PSRAM disabled)");
 
     // Initialize IRAM heap for WiFi and small allocations
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
@@ -617,7 +662,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             polarity: Polarity::IdleLow,
             phase: Phase::ShiftLow,
         })
-        .with_frequency(Rate::from_mhz(10))
+        .with_frequency(Rate::from_mhz(20))
         .with_format(Format {
             enable_2byte_mode: true,
             ..Default::default()
@@ -674,13 +719,12 @@ async fn main(spawner: embassy_executor::Spawner) {
         Box::new([Rgb565Pixel(0); LCD_BUFFER_SIZE]);
     let pixel_buf: &mut [Rgb565Pixel] = &mut *pixel_box;
 
-    // Initialize pixel buffer and DMA buffer
+    // Initialize pixel buffer and DMA buffer using optimized bulk copy
     let dst = dma_tx.as_mut_slice();
-    for (i, px) in pixel_buf.iter().enumerate() {
-        let [lo, hi] = px.0.to_le_bytes();
-        dst[2 * i] = lo;
-        dst[2 * i + 1] = hi;
-    }
+    let src = unsafe {
+        core::slice::from_raw_parts(pixel_buf.as_ptr() as *const u8, pixel_buf.len() * 2)
+    };
+    dst.copy_from_slice(src);
 
     // Initial flush of the screen buffer
     match dpi.send(false, dma_tx) {
@@ -708,8 +752,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
-    let (mut wifi_controller, interfaces) =
-        esp_radio::wifi::new(radio_init, peripherals.WIFI, Config::default())
+    let (wifi_controller, interfaces) =
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
     // Extract the station interface for WiFi operations
@@ -805,42 +849,97 @@ async fn main(spawner: embassy_executor::Spawner) {
     // Trigger initial refresh
     ui.invoke_wifi_refresh();
 
-    // Convert pixel buffer to static for graphics task
-    let pixel_buf_static: &'static mut [Rgb565Pixel; LCD_BUFFER_SIZE] = Box::leak(pixel_box);
+    // Allocate framebuffer in PSRAM following esope dual-core approach
+    let mut fb_box: Box<[Rgb565Pixel; LCD_BUFFER_SIZE]> =
+        Box::new([Rgb565Pixel(0); LCD_BUFFER_SIZE]);
 
-    // Store UI reference for tasks
-    let ui_for_tasks = ui.as_weak();
-    let ui_for_auto_refresh = ui.as_weak();
+    // Create test pattern first to verify display works
+    for i in 0..LCD_BUFFER_SIZE {
+        let x = i % LCD_H_RES_USIZE;
+        let y = i / LCD_H_RES_USIZE;
+        // Create a simple test pattern - gradient from green to blue
+        let g = (x * 31 / LCD_H_RES_USIZE) as u8;
+        let b = (y * 31 / LCD_V_RES_USIZE) as u8;
+        fb_box[i] = Rgb565Pixel(((g as u16) << 11) | ((b as u16) << 0));
+    }
+    info!("Test pattern written to framebuffer");
 
-    // Store WiFi controller for the render loop task
-    let wifi_ctrl = wifi_controller;
+    let fb_ptr: *mut Rgb565Pixel = fb_box.as_mut_ptr();
+    let psram_buf: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u8, FRAME_BYTES) };
 
-    // Spawn WiFi scanning task
-    info!("Spawning WiFi scan task");
-    spawner.spawn(wifi_scan_task(wifi_ctrl)).ok();
+    // Verify PSRAM buffer allocation and alignment (CRITICAL!)
+    let buf_ptr = psram_buf.as_ptr() as usize;
+    info!("PSRAM buffer allocated at address: 0x{:08X}", buf_ptr);
+    info!("PSRAM buffer length: {}", psram_buf.len());
+    info!("PSRAM buffer alignment modulo 64: {}", buf_ptr % 64);
+    assert!(
+        buf_ptr % 64 == 0,
+        "PSRAM buffer must be 64-byte aligned for DMA"
+    );
 
-    // Spawn automatic WiFi UI refresh task
-    info!("Spawning automatic WiFi refresh task");
-    spawner
-        .spawn(auto_wifi_refresh_task(ui_for_auto_refresh))
-        .ok();
+    // Publish PSRAM buffer pointer and len for other cores
+    unsafe {
+        PSRAM_BUF_PTR = psram_buf.as_mut_ptr();
+        PSRAM_BUF_LEN = psram_buf.len();
+    }
 
-    // Spawn graphics rendering task with all required resources
-    info!("Spawning graphics rendering task");
-    spawner
-        .spawn(graphics_task(
-            window.clone(),
-            ui_for_tasks,
-            dpi,
-            dma_tx,
-            pixel_buf_static,
-        ))
-        .ok();
+    // Configure DMA buffer with proper burst configuration
+    let dma_tx: DmaTxBuf = unsafe {
+        DmaTxBuf::new_with_config(
+            &mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS),
+            psram_buf,
+            ExternalBurstConfig::Size64,
+        )
+        .unwrap()
+    };
+
+    // Split peripherals for multicore usage
+    let (dpi_for_display, _) = (dpi, ());
+
+    // Signal that PSRAM is ready
+    PSRAM_READY.signal(());
+
+    // Initialize software interrupts for multicore support
+    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+
+    // **CRITICAL**: Start app core with esp-rtos dual-core
+    let app_core_stack = APP_CORE_STACK.init(Stack::new());
+    esp_rtos::start_second_core(
+        peripherals.CPU_CTRL,
+        sw_ints.software_interrupt0,
+        sw_ints.software_interrupt1,
+        app_core_stack,
+        move || {
+            static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+            let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
+            executor.run(|spawner| {
+                spawner
+                    .spawn(dma_display_task(dpi_for_display, dma_tx))
+                    .ok();
+            });
+        },
+    );
 
     // Show the window
     ui.show().unwrap();
 
-    info!("=== All systems initialized, entering main loop ===");
+    info!("=== All systems initialized, dual-core active ===");
+    info!("Core 0: WiFi + Slint rendering + Touch polling");
+    info!("Core 1: DMA display output");
+
+    // **Core 0**: Spawn WiFi tasks
+    info!("Spawning WiFi scan task on Core 0");
+    spawner.spawn(wifi_scan_task(wifi_controller)).ok();
+
+    info!("Spawning automatic WiFi refresh task on Core 0");
+    spawner.spawn(auto_wifi_refresh_task(ui.as_weak())).ok();
+
+    // **Core 0**: Spawn Slint rendering task
+    info!("Spawning Slint rendering task on Core 0");
+    spawner
+        .spawn(slint_rendering_task(window.clone(), ui.as_weak()))
+        .ok();
 
     // === Touch Polling Integration ===
     info!("Starting continuous touch polling and Slint integration...");

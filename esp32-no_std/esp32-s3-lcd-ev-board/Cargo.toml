@@ -5,6 +5,10 @@ authors = ["Michael Winkelmann <michael@winkelmann.site>"]
 edition = "2024"
 rust-version = "1.88"
 
+[features]
+default = ["psram"]
+psram = []
+
 [dependencies]
 log = { version = "0.4", default-features = false }
 
