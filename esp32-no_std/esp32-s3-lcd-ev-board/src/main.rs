@@ -5,29 +5,51 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::string::String;
 use alloc::vec;
 use core::panic::PanicInfo;
 use log::{error, info};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// WiFi imports
+// WiFi imports - using esp-radio
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Ticker};
-use esp_hal::rng::Rng;
-use esp_hal::timer::timg::TimerGroup;
-use esp_wifi::EspWifiController;
-use esp_wifi::wifi::{AccessPointInfo, ClientConfiguration, Configuration, WifiController};
+use esp_radio::wifi::{
+    AccessPointInfo, ClientConfig, Config, ModeConfig, ScanConfig, WifiController,
+};
 
 // ESP32 HAL imports
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::time::Rate;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::logger::init_logger_from_env;
+
+// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
+
+// Heap statistics function
+fn report_heap_stats(context: &str) {
+    let used = esp_alloc::HEAP.used();
+    let free = esp_alloc::HEAP.free();
+    info!(
+        "[HEAP STATS] {}: Used: {} bytes, Free: {} bytes, Total: {} bytes",
+        context,
+        used,
+        free,
+        used + free
+    );
+}
 
 // ESP32-S3-LCD-EV-Board hardware imports
 use esp_hal::delay::Delay;
@@ -69,31 +91,6 @@ static mut TX_DESCRIPTORS: [DmaDescriptor; NUM_DMA_DESC] = [DmaDescriptor::EMPTY
 fn panic(info: &PanicInfo) -> ! {
     error!("PANIC: {}", info);
     loop {}
-}
-
-// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
-
-fn init_heap(psram: &esp_hal::peripherals::PSRAM<'_>) {
-    let (start, size) = esp_hal::psram::psram_raw_parts(psram);
-    info!(
-        "Initializing PSRAM heap: start: {:p}, size: {}",
-        start, size
-    );
-    unsafe {
-        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-            start,
-            size,
-            esp_alloc::MemoryCapability::External.into(),
-        ));
-    }
 }
 
 /// FT5x06 Touch Controller for ESP32-S3-LCD-EV-Board
@@ -442,18 +439,20 @@ async fn graphics_task(
 async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     info!("=== WiFi scan task started ====");
 
-    // Start WiFi
-    let client_config = Configuration::Client(ClientConfiguration {
-        ssid: String::new(),
-        password: String::new(),
-        ..Default::default()
-    });
+    // Check WiFi capabilities
+    info!("WiFi capabilities: {:?}", wifi_controller.capabilities());
 
-    match wifi_controller.set_configuration(&client_config) {
+    // Report heap statistics after WiFi scanning task starts
+    report_heap_stats("After WiFi scanning task spawn");
+
+    // Configure WiFi as Client (following esope-sld-c-w-s3 working pattern)
+    let client_config = ModeConfig::Client(ClientConfig::default());
+    match wifi_controller.set_config(&client_config) {
         Ok(_) => info!("WiFi configuration set successfully"),
         Err(e) => info!("Failed to set WiFi configuration: {:?}", e),
     }
 
+    // Start WiFi
     match wifi_controller.start_async().await {
         Ok(_) => info!("WiFi started successfully!"),
         Err(e) => info!("Failed to start WiFi: {:?}", e),
@@ -465,7 +464,10 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     loop {
         info!("Performing WiFi scan...");
 
-        match wifi_controller.scan_n_async(10).await {
+        match wifi_controller
+            .scan_with_config_async(ScanConfig::default().with_max(10))
+            .await
+        {
             Ok(results) => {
                 info!("Found {} networks:", results.len());
                 for (i, ap) in results.iter().enumerate() {
@@ -499,21 +501,26 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     }
 }
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
     // Initialize peripherals first
-    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz));
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
 
-    // Initialize BOTH heap allocators - WiFi first in internal RAM, then PSRAM for GUI
-    // Step 1: Initialize internal RAM heap for WiFi (must be first)
-    esp_alloc::heap_allocator!(size: 180 * 1024);
+    // Initialize IRAM heap for WiFi and small allocations
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
+    esp_alloc::heap_allocator!(size: 90 * 1024);
 
-    // Step 2: Initialize PSRAM heap for GUI and other data
-    init_heap(&peripherals.PSRAM);
+    // Initialize PSRAM heap for large allocations like framebuffer using esp-hal 1.0.0 macro
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    info!("PSRAM heap initialized using psram_allocator! macro");
 
     // Initialize logger
     init_logger_from_env();
     info!("Peripherals initialized");
+
+    // Report initial heap statistics
+    report_heap_stats("After heap initialization");
 
     info!("Starting Slint ESP32-S3-LCD-EV-Board Workshop");
 
@@ -680,25 +687,25 @@ async fn main(spawner: embassy_executor::Spawner) {
         }
     }
 
-    // Initialize WiFi first (matching ESoPe working pattern)
+    // Initialize embassy timer for task scheduling BEFORE spawning tasks
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let rng = Rng::new(peripherals.RNG);
+    // For ESP32-S3 (Xtensa), we don't need the software interrupt parameter
+    esp_rtos::start(timg0.timer0);
+    info!("esp-rtos timer initialized");
 
+    // Initialize WiFi using new esp-radio API FIRST (before framebuffer allocation)
     info!("Initializing WiFi...");
-    let esp_wifi_ctrl = &*mk_static!(
-        EspWifiController<'static>,
-        esp_wifi::init(timg0.timer0, rng.clone()).expect("Failed to initialize WiFi")
+    let radio_init = mk_static!(
+        esp_radio::Controller<'static>,
+        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
-    info!("WiFi controller initialized");
+    let (mut wifi_controller, interfaces) =
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Config::default())
+            .expect("Failed to initialize Wi-Fi controller");
 
-    let (wifi_controller, _interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI)
-        .expect("Failed to create WiFi interface");
-    info!("WiFi interface created");
-
-    // Initialize embassy timer for task scheduling AFTER WiFi (matching ESoPe pattern)
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init(timg1.timer0);
-    info!("Embassy timer initialized");
+    // Extract the station interface for WiFi operations
+    let _wifi_interface = interfaces.sta;
+    info!("WiFi controller initialized with station interface");
 
     // Small delay to ensure WiFi initialization is complete
     embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
@@ -775,9 +782,12 @@ async fn main(spawner: embassy_executor::Spawner) {
     let ui_for_tasks = ui.as_weak();
     let ui_for_auto_refresh = ui.as_weak();
 
+    // Store WiFi controller for the render loop task
+    let wifi_ctrl = wifi_controller;
+
     // Spawn WiFi scanning task
     info!("Spawning WiFi scan task");
-    spawner.spawn(wifi_scan_task(wifi_controller)).ok();
+    spawner.spawn(wifi_scan_task(wifi_ctrl)).ok();
 
     // Spawn automatic WiFi UI refresh task
     info!("Spawning automatic WiFi refresh task");
