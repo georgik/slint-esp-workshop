@@ -1,30 +1,25 @@
 #![no_std]
 #![no_main]
 
-// Import embedded_graphics_core types
-use embedded_graphics_core::pixelcolor::Rgb565;
-use embedded_graphics_framebuf::backends::FrameBufferBackend;
-// --- Slint platform integration imports ---
-use slint::PhysicalSize;
-use slint::platform::software_renderer::Rgb565Pixel;
-
-use alloc::alloc::{alloc, handle_alloc_error};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::string::String;
 use alloc::vec;
-use core::alloc::Layout;
 use core::cell::RefCell;
+
+// Display imports
+use embedded_graphics_core::pixelcolor::Rgb565;
+use embedded_graphics_framebuf::backends::FrameBufferBackend;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // WiFi imports
 use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use esp_radio::wifi::{
-    AccessPointInfo, ClientConfig, Config, ModeConfig, ScanConfig, WifiController, WifiError,
-};
+use embassy_sync::signal::Signal;
+use esp_radio::wifi::{AccessPointInfo, ClientConfig, ModeConfig, ScanConfig, WifiController};
 
+// Display imports
 use eeprom24x::{Eeprom24x, SlaveAddr};
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_hal::clock::CpuClock;
@@ -32,6 +27,7 @@ use esp_hal::dma::ExternalBurstConfig;
 use esp_hal::dma::{CHUNK_SIZE, DmaDescriptor, DmaTxBuf};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::I2c;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::lcd_cam::{
     LcdCam,
     lcd::{
@@ -39,64 +35,21 @@ use esp_hal::lcd_cam::{
         dpi::{Config as DpiConfig, Dpi, Format, FrameTiming},
     },
 };
-
-// Type alias for I2C device to simplify signatures
-type I2cDevice = RefCellDevice<'static, esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>;
-type TouchController = sitronix_touch::TouchIC<I2cDevice>;
-use esp_hal::Config as HalConfig;
-use esp_hal::peripherals::Peripherals;
-use esp_hal::system::{CpuControl, Stack};
-use esp_hal::time::{Instant, Rate};
+use esp_hal::rng::Rng;
+use esp_hal::system::Stack;
+use esp_hal::time::Rate;
 use esp_hal::timer::{AnyTimer, timg::TimerGroup};
 use esp_println::logger::init_logger_from_env;
 use log::{debug, error, info};
 
 use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Ticker, Timer};
-use esp_rtos::embassy::Executor;
+use embassy_time::{Duration, Ticker};
 use static_cell::StaticCell;
-
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    error!("PANIC: {}", info);
-    loop {}
-}
-
-// Heap statistics function
-fn report_heap_stats(context: &str) {
-    let used = esp_alloc::HEAP.used();
-    let free = esp_alloc::HEAP.free();
-    info!(
-        "[HEAP STATS] {}: Used: {} bytes, Free: {} bytes, Total: {} bytes",
-        context,
-        used,
-        free,
-        used + free
-    );
-}
-
-extern crate alloc;
-
-struct EspBackend {
-    window: RefCell<Option<Rc<slint::platform::software_renderer::MinimalSoftwareWindow>>>,
-    peripherals: RefCell<Option<Peripherals>>,
-}
-
-impl Default for EspBackend {
-    fn default() -> Self {
-        EspBackend {
-            window: RefCell::new(None),
-            peripherals: RefCell::new(None),
-        }
-    }
-}
 
 // Static storage for I2C bus
 static I2C_BUS: StaticCell<RefCell<I2c<'static, esp_hal::Blocking>>> = StaticCell::new();
 
-/// FrameBufferBackend wrapper for a PSRAM-backed [Rgb565; N] slice.
+// FrameBufferBackend wrapper for a PSRAM-backed [Rgb565; N] slice.
 pub struct PSRAMFrameBuffer<'a> {
     buf: &'a mut [Rgb565; LCD_BUFFER_SIZE],
 }
@@ -120,375 +73,27 @@ impl<'a> FrameBufferBackend for PSRAMFrameBuffer<'a> {
     }
 }
 
-impl slint::platform::Platform for EspBackend {
-    fn create_window_adapter(
-        &self,
-    ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
-        let window = slint::platform::software_renderer::MinimalSoftwareWindow::new(
-            slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
-        );
-        self.window.replace(Some(window.clone()));
-        Ok(window)
-    }
-
-    fn duration_since_start(&self) -> core::time::Duration {
-        core::time::Duration::from_millis(Instant::now().duration_since_epoch().as_millis())
-    }
-
-    fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
-        info!("=== Starting Main Event Loop ===");
-        // Heap tracking disabled due to esp-rtos allocator
-        info!("Heap usage tracking disabled");
-
-        let peripherals = self
-            .peripherals
-            .borrow_mut()
-            .take()
-            .expect("Peripherals already taken");
-
-        // Read and set up the display configuration from EEPROM
-        let i2c = I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
-            .unwrap()
-            .with_sda(peripherals.GPIO1)
-            .with_scl(peripherals.GPIO41);
-        let i2c_bus = I2C_BUS.init(RefCell::new(i2c));
-        let mut eeid = [0u8; 0x1c];
-        let mut eeprom = Eeprom24x::new_24x01(RefCellDevice::new(i2c_bus), SlaveAddr::default());
-        eeprom.read_data(0x00, &mut eeid).unwrap();
-        let display_width = u16::from_be_bytes([eeid[8], eeid[9]]);
-        let display_height = u16::from_be_bytes([eeid[10], eeid[11]]);
-        info!(
-            "Display size from EEPROM: {}x{}",
-            display_width, display_height
-        );
-
-        // Use hardcoded display size if EEPROM is empty or invalid (like reference implementation)
-        let actual_display_width = if display_width == 0 {
-            LCD_H_RES
-        } else {
-            display_width
-        };
-        let actual_display_height = if display_height == 0 {
-            LCD_V_RES
-        } else {
-            display_height
-        };
-        info!(
-            "Using display size: {}x{}",
-            actual_display_width, actual_display_height
-        );
-
-        // Initialize touch controller using shared I2C bus
-        info!("Initializing touch controller...");
-        let touch_device = RefCellDevice::new(i2c_bus);
-        let mut touch_controller = sitronix_touch::TouchIC::new_default(touch_device);
-        match touch_controller.init() {
-            Ok(_) => info!("Touch controller initialized successfully"),
-            Err(e) => {
-                error!("Failed to initialize touch controller: {:?}", e);
-                // Continue without touch support
-            }
-        }
-
-        // Enable panel / backlight
-        let mut panel_enable = Output::new(peripherals.GPIO42, Level::Low, OutputConfig::default());
-        panel_enable.set_high();
-
-        let mut backlight = Output::new(peripherals.GPIO39, Level::Low, OutputConfig::default());
-        backlight.set_high();
-
-        let mut _touch_reset = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
-
-        info!("Display initialized, entering main loop...");
-
-        // Allocate framebuffer in PSRAM with 64-byte alignment for DMA
-        const FRAME_BYTES: usize = LCD_BUFFER_SIZE * 2;
-
-        // Use aligned allocation for DMA requirements
-        let layout = Layout::from_size_align(FRAME_BYTES, 64)
-            .expect("Failed to create layout for framebuffer");
-        let fb_ptr = unsafe { alloc(layout) };
-
-        if fb_ptr.is_null() {
-            handle_alloc_error(layout);
-        }
-
-        // Initialize the buffer with green color
-        let fb_slice = unsafe { core::slice::from_raw_parts_mut(fb_ptr, FRAME_BYTES) };
-        let rgb565_slice =
-            unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut Rgb565, LCD_BUFFER_SIZE) };
-
-        // Fill with green color (0, 31, 0)
-        for pixel in rgb565_slice.iter_mut() {
-            *pixel = Rgb565::new(0, 31, 0);
-        }
-
-        let psram_buf: &'static mut [u8] = fb_slice;
-
-        // Verify PSRAM buffer allocation and alignment
-        let buf_ptr = psram_buf.as_ptr() as usize;
-        info!("PSRAM buffer allocated at address: 0x{:08X}", buf_ptr);
-        info!("PSRAM buffer length: {}", psram_buf.len());
-        info!("PSRAM buffer alignment modulo 64: {}", buf_ptr % 64);
-        assert!(
-            buf_ptr % 64 == 0,
-            "PSRAM buffer must be 64-byte aligned for DMA"
-        );
-
-        // Publish PSRAM buffer pointer and len for app core
-        unsafe {
-            PSRAM_BUF_PTR = psram_buf.as_mut_ptr();
-            PSRAM_BUF_LEN = psram_buf.len();
-        }
-
-        // Configure DMA buffer with proper burst configuration
-        info!("=== DMA Buffer Configuration ===");
-        let heap_before_dma = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage before DMA buffer creation: {} bytes",
-            heap_before_dma
-        );
-
-        let dma_tx: DmaTxBuf = unsafe {
-            DmaTxBuf::new_with_config(
-                &mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS),
-                psram_buf,
-                ExternalBurstConfig::Size64,
-            )
-            .unwrap()
-        };
-
-        let heap_after_dma = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage after DMA buffer creation: {} bytes (delta: +{})",
-            heap_after_dma,
-            heap_after_dma.saturating_sub(heap_before_dma)
-        );
-
-        // Initialize LCD DPI interface
-        let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
-
-        // Read configuration from EEPROM
-        let pclk_hz = ((eeid[12] as u32) * 1_000_000 + (eeid[13] as u32) * 100_000).min(13_600_000);
-        let flags = eeid[25];
-        let hsync_idle_low = (flags & 0x01) != 0;
-        let vsync_idle_low = (flags & 0x02) != 0;
-        let de_idle_high = (flags & 0x04) != 0;
-        let pclk_active_neg = (flags & 0x20) != 0;
-
-        // Use safe defaults if EEPROM values are invalid (like reference implementation)
-        let actual_pclk_hz = if pclk_hz == 0 { 10_000_000 } else { pclk_hz }; // 10MHz default
-
-        // Log display configuration to match Conway's working values
-        info!("Display configuration:");
-        info!("  EEPROM Resolution: {}x{}", display_width, display_height);
-        info!(
-            "  Actual Resolution: {}x{}",
-            actual_display_width, actual_display_height
-        );
-        info!("  EEPROM PCLK: {} Hz", pclk_hz);
-        info!("  Actual PCLK: {} Hz", actual_pclk_hz);
-        info!("  Flags: 0x{:02X}", flags);
-        info!("  HSYNC idle low: {}", hsync_idle_low);
-        info!("  VSYNC idle low: {}", vsync_idle_low);
-        info!("  DE idle high: {}", de_idle_high);
-        info!("  PCLK active neg: {}", pclk_active_neg);
-
-        let dpi_config = DpiConfig::default()
-            .with_clock_mode(ClockMode {
-                polarity: if pclk_active_neg {
-                    Polarity::IdleHigh
-                } else {
-                    Polarity::IdleLow
-                },
-                phase: if pclk_active_neg {
-                    Phase::ShiftHigh
-                } else {
-                    Phase::ShiftLow
-                },
-            })
-            .with_frequency(Rate::from_hz(actual_pclk_hz))
-            .with_format(Format {
-                enable_2byte_mode: true,
-                ..Default::default()
-            })
-            // Use exact timing values that work with Conway's implementation
-            .with_timing(FrameTiming {
-                horizontal_active_width: 320,
-                horizontal_total_width: 320 + 4 + 43 + 79 + 8, // =446 (Conway's working value)
-                horizontal_blank_front_porch: 79 + 8,          // was 47, add 32px
-                vertical_active_height: 240,
-                vertical_total_height: 240 + 4 + 12 + 16, // increased blank front porch to 16
-                vertical_blank_front_porch: 16,
-                hsync_width: 4,
-                vsync_width: 4,
-                hsync_position: 43 + 4, // (= back_porch + pulse = 47) Conway's working value
-            })
-            .with_vsync_idle_level(if vsync_idle_low {
-                Level::Low
-            } else {
-                Level::High
-            })
-            .with_hsync_idle_level(if hsync_idle_low {
-                Level::Low
-            } else {
-                Level::High
-            })
-            .with_de_idle_level(if de_idle_high {
-                Level::High
-            } else {
-                Level::Low
-            })
-            .with_disable_black_region(false);
-
-        let dpi = Dpi::new(lcd_cam.lcd, peripherals.DMA_CH2, dpi_config)
-            .unwrap()
-            .with_vsync(peripherals.GPIO6)
-            .with_hsync(peripherals.GPIO15)
-            .with_de(peripherals.GPIO5)
-            .with_pclk(peripherals.GPIO4)
-            // Blue bus
-            .with_data0(peripherals.GPIO9)
-            .with_data1(peripherals.GPIO17)
-            .with_data2(peripherals.GPIO46)
-            .with_data3(peripherals.GPIO16)
-            .with_data4(peripherals.GPIO7)
-            // Green bus
-            .with_data5(peripherals.GPIO8)
-            .with_data6(peripherals.GPIO21)
-            .with_data7(peripherals.GPIO3)
-            .with_data8(peripherals.GPIO11)
-            .with_data9(peripherals.GPIO18)
-            .with_data10(peripherals.GPIO10)
-            // Red bus
-            .with_data11(peripherals.GPIO14)
-            .with_data12(peripherals.GPIO20)
-            .with_data13(peripherals.GPIO13)
-            .with_data14(peripherals.GPIO19)
-            .with_data15(peripherals.GPIO12);
-
-        // Tell Slint the window dimensions match the display resolution
-        let size = PhysicalSize::new(LCD_H_RES.into(), LCD_V_RES.into());
-        self.window
-            .borrow()
-            .as_ref()
-            .expect("Window adapter not created")
-            .set_size(size);
-
-        // Initialize Embassy with both timers for multicore support
-        info!("=== Embassy Initialization ===");
-        let heap_before_embassy = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage before Embassy init: {} bytes",
-            heap_before_embassy
-        );
-
-        let timg0 = TimerGroup::new(peripherals.TIMG0);
-        let timer0: AnyTimer = timg0.timer0.into();
-        let timg1 = TimerGroup::new(peripherals.TIMG1);
-        let timer1: AnyTimer = timg1.timer0.into();
-
-        // Note: This dual-core Embassy initialization is not used in main execution path
-        // info!("Initializing Embassy with dual timers for multicore support...");
-        // esp_hal_embassy::init([timer0, timer1]);
-
-        let heap_after_embassy = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage after Embassy init: {} bytes (delta: +{})",
-            heap_after_embassy,
-            heap_after_embassy.saturating_sub(heap_before_embassy)
-        );
-
-        // Signal that PSRAM is ready for the app core
-        info!("Signaling PSRAM ready for app core...");
-        PSRAM_READY.signal(());
-
-        // Spawn app core for DMA display task (matching Conway)
-        info!("=== App Core Startup ===");
-        let heap_before_core = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage before app core startup: {} bytes",
-            heap_before_core
-        );
-
-        let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
-        info!("Starting app core (Core 1) for DMA display task...");
-        let _app_core = cpu_control.start_app_core(
-            unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
-            move || {
-                info!("App core started! Initializing Embassy executor on Core 1...");
-
-                // Initialize and run Embassy executor on app core
-                static APP_EXECUTOR: StaticCell<Executor> = StaticCell::new();
-                let executor = APP_EXECUTOR.init(Executor::new());
-                info!("App core executor initialized, spawning DMA task...");
-
-                executor.run(
-                    |spawner| match spawner.spawn(dma_display_task(dpi, dma_tx)) {
-                        Ok(_) => info!("DMA display task spawned successfully on Core 1"),
-                        Err(e) => error!("Failed to spawn DMA display task: {:?}", e),
-                    },
-                );
-            },
-        );
-
-        // Initialize Embassy executor on main core for Slint rendering
-        info!("=== Main Core Executor Setup ===");
-        let heap_before_main_exec = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage before main executor init: {} bytes",
-            heap_before_main_exec
-        );
-
-        static MAIN_EXECUTOR: StaticCell<Executor> = StaticCell::new();
-        let executor = MAIN_EXECUTOR.init(Executor::new());
-        info!("Main core executor initialized on Core 0");
-
-        let window = self
-            .window
-            .borrow()
-            .as_ref()
-            .expect("Window not created")
-            .clone();
-
-        let heap_before_rendering_spawn = esp_alloc::HEAP.used();
-        info!(
-            "Heap usage before Slint rendering task spawn: {} bytes",
-            heap_before_rendering_spawn
-        );
-
-        executor.run(|spawner| {
-            match spawner.spawn(slint_rendering_task(window, touch_controller)) {
-                Ok(_) => info!("Slint rendering task spawned successfully on Core 0"),
-                Err(e) => error!("Failed to spawn Slint rendering task: {:?}", e),
-            }
-
-            let heap_after_tasks = esp_alloc::HEAP.used();
-            info!(
-                "Final heap usage after all tasks spawned: {} bytes",
-                heap_after_tasks
-            );
-            info!("=== All tasks running, entering main executor loop ===");
-        });
-    }
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    error!("PANIC: {}", info);
+    loop {}
 }
-// Constants matching Conway's implementation
+
+extern crate alloc;
+
+// Constants
 const LCD_H_RES_USIZE: usize = 320;
 const LCD_V_RES_USIZE: usize = 240;
 const LCD_BUFFER_SIZE: usize = LCD_H_RES_USIZE * LCD_V_RES_USIZE;
+const FRAME_BYTES: usize = LCD_BUFFER_SIZE * 2;
 
-// Embassy multicore: allocate app core stack with reduced size to save memory
-static mut APP_CORE_STACK: Stack<4096> = Stack::new();
+// Embassy multicore: allocate app core stack
+static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
 
+// PSRAM synchronization signals
 static PSRAM_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static DMA_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static FRAME_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static mut PSRAM_BUF_PTR: *mut u8 = core::ptr::null_mut();
 static mut PSRAM_BUF_LEN: usize = 0;
-
-// === Display constants ===
-const LCD_H_RES: u16 = 320;
-const LCD_V_RES: u16 = 240;
 
 // Full-screen DMA constants
 const MAX_FRAME_BYTES: usize = 320 * 240 * 2;
@@ -537,41 +142,13 @@ impl slint::platform::Platform for EspEmbassyBackend {
     }
 }
 
-// Automatic WiFi UI refresh task
-#[embassy_executor::task]
-async fn auto_wifi_refresh_task(ui_weak: slint::Weak<MainWindow>) {
-    info!("=== Auto WiFi refresh task started ====");
-
-    let mut ticker = Ticker::every(Duration::from_secs(2));
-
-    loop {
-        ticker.next().await;
-
-        // Check if new WiFi scan results are available
-        if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
-            // Try to upgrade weak reference to UI
-            if let Some(ui) = ui_weak.upgrade() {
-                info!("Auto-refreshing WiFi UI with new scan results");
-                ui.invoke_wifi_refresh();
-            } else {
-                // UI has been dropped, stop the task
-                info!("UI reference dropped, stopping auto-refresh task");
-                break;
-            }
-        }
-    }
-}
-
-// WiFi scanning task
+// WiFi scanning task - runs on Core 0
 #[embassy_executor::task]
 async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     info!("=== WiFi scan task started ====");
 
     // Check WiFi capabilities
     info!("WiFi capabilities: {:?}", wifi_controller.capabilities());
-
-    // Report heap statistics after WiFi scanning task starts
-    report_heap_stats("After WiFi scanning task spawn");
 
     // Configure WiFi as Client (following working pattern)
     let client_config = ModeConfig::Client(ClientConfig::default());
@@ -627,60 +204,149 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     }
 }
 
-/// Initialize the heap and set the Slint platform.
-pub fn init() {
-    // Initialize peripherals first.
-    let config = HalConfig::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-    init_logger_from_env();
-    info!("=== ESP32-S3 ESoPe Board Initialization Starting ===");
-    info!("Peripherals initialized");
+// Automatic WiFi UI refresh task - runs on Core 0
+#[embassy_executor::task]
+async fn auto_wifi_refresh_task(ui_weak: slint::Weak<MainWindow>) {
+    info!("=== Auto WiFi refresh task started ====");
 
-    // Log memory status before PSRAM init
-    let heap_start = esp_alloc::HEAP.used();
-    info!("Heap usage before PSRAM init: {} bytes", heap_start);
+    let mut ticker = Ticker::every(Duration::from_secs(2));
 
-    // Initialize the PSRAM allocator.
-    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
-    info!("PSRAM allocator initialized");
+    loop {
+        ticker.next().await;
 
-    // Log memory status after PSRAM init
-    let heap_after_psram = esp_alloc::HEAP.used();
-    info!(
-        "Heap usage after PSRAM init: {} bytes (delta: +{})",
-        heap_after_psram,
-        heap_after_psram.saturating_sub(heap_start)
-    );
+        // Check if new WiFi scan results are available
+        if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
+            // Try to upgrade weak reference to UI
+            if let Some(ui) = ui_weak.upgrade() {
+                info!("Auto-refreshing WiFi UI with new scan results");
+                ui.invoke_wifi_refresh();
+            } else {
+                // UI has been dropped, stop the task
+                info!("UI reference dropped, stopping auto-refresh task");
+                break;
+            }
+        }
+    }
+}
 
-    // Create and install the Slint backend that owns the peripherals.
-    info!("Creating Slint platform backend...");
-    let heap_before_backend = esp_alloc::HEAP.used();
+// DMA display task - runs on Core 1
+#[embassy_executor::task]
+async fn dma_display_task(mut dpi: Dpi<'static, esp_hal::Blocking>, mut dma_tx: DmaTxBuf) {
+    info!("[CORE 1] DMA display task started, sending DMA frames");
 
-    slint::platform::set_platform(Box::new(EspBackend {
-        window: RefCell::new(None),
-        peripherals: RefCell::new(Some(peripherals)),
-    }))
-    .expect("Slint platform already initialized");
+    loop {
+        let frame_bytes = 320 * 240 * 2; // Fixed to known display size
+        dma_tx.set_length(frame_bytes);
 
-    let heap_after_backend = esp_alloc::HEAP.used();
-    info!(
-        "Slint backend created. Heap usage: {} bytes (delta: +{})",
-        heap_after_backend,
-        heap_after_backend.saturating_sub(heap_before_backend)
-    );
-    info!("=== Initialization Complete ===");
+        match dpi.send(false, dma_tx) {
+            Ok(xfer) => {
+                let (res, new_dpi, new_dma_tx) = xfer.wait();
+                dpi = new_dpi;
+                dma_tx = new_dma_tx;
+                if let Err(e) = res {
+                    error!("[CORE 1] DMA transfer error: {:?}", e);
+                }
+            }
+            Err((e, new_dpi, new_dma_tx)) => {
+                error!("[CORE 1] DMA send error: {:?}", e);
+                dpi = new_dpi;
+                dma_tx = new_dma_tx;
+            }
+        }
+    }
+}
+
+// Slint rendering task - runs on Core 0
+#[embassy_executor::task]
+async fn slint_rendering_task(
+    window: Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
+    ui: slint::Weak<MainWindow>,
+) {
+    info!("[CORE 0] Slint rendering task started");
+
+    // Wait until PSRAM is ready
+    loop {
+        if PSRAM_READY.try_take().is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    info!("[CORE 0] PSRAM ready, starting Slint rendering");
+
+    // SAFETY: PSRAM_BUF_PTR and PSRAM_BUF_LEN are published before this task starts
+    let psram_ptr = unsafe { PSRAM_BUF_PTR };
+    let psram_len = unsafe { PSRAM_BUF_LEN };
+
+    // Convert to Rgb565 buffer following Conway's approach
+    let fb: &mut [Rgb565; LCD_BUFFER_SIZE] =
+        unsafe { &mut *(psram_ptr as *mut [Rgb565; LCD_BUFFER_SIZE]) };
+
+    let mut frame_counter = 0u32;
+
+    let mut ticker = Ticker::every(Duration::from_millis(16)); // ~60fps
+    loop {
+        // Update Slint timers and animations
+        slint::platform::update_timers_and_animations();
+
+        // Check for new WiFi scan results and trigger UI refresh if available
+        if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
+            if let Some(ui_strong) = ui.upgrade() {
+                ui_strong.invoke_wifi_refresh();
+                debug!("Triggered UI refresh for new WiFi scan results");
+            }
+        }
+
+        // Use draw_if_needed to check if we need to render and get access to the renderer
+        let rendered = window.draw_if_needed(|renderer| {
+            // Render directly to PSRAM buffer
+            let pixel_slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    fb.as_mut_ptr() as *mut slint::platform::software_renderer::Rgb565Pixel,
+                    LCD_BUFFER_SIZE,
+                )
+            };
+            renderer.render(pixel_slice, LCD_H_RES_USIZE);
+
+            if frame_counter % 60 == 0 {
+                debug!("[CORE 0] Frame {} rendered by Slint", frame_counter);
+            }
+        });
+
+        // If a frame was rendered, log it
+        if rendered {
+            if frame_counter % 60 == 0 {
+                info!(
+                    "[CORE 0] Frame {} rendered and displayed on ESP32-S3 ESoPe",
+                    frame_counter
+                );
+            }
+        }
+
+        frame_counter = frame_counter.wrapping_add(1);
+
+        // Log periodic status
+        if frame_counter % 300 == 0 {
+            // Every ~5 seconds at 60fps
+            info!(
+                "[CORE 0] Slint: Frame {}, ESP32-S3 ESoPe display active",
+                frame_counter
+            );
+        }
+
+        ticker.next().await;
+    }
 }
 
 // Use Slint build compilation helper
 slint::include_modules!();
 
 #[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-    // Initialize peripherals first.
-    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+async fn main(spawner: Spawner) {
+    // Initialize peripherals with multiple heap allocators
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
 
-    // Initialize BOTH heap allocators - WiFi first in internal RAM, then PSRAM for GUI
-    // Initialize IRAM heap for WiFi and small allocations
+    // Initialize IRAM heap for WiFi and small allocations (following esp32-s3-box-3 pattern)
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
     esp_alloc::heap_allocator!(size: 90 * 1024);
 
@@ -688,14 +354,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
     info!("PSRAM heap initialized using psram_allocator! macro");
 
-    // Initialize logger
-    init_logger_from_env();
-    info!("Peripherals initialized");
-
-    // Report initial heap statistics
-    report_heap_stats("After heap initialization");
-
-    // Initialize embassy timer BEFORE esp_radio::init()
+    // Initialize Embassy timer for esp-rtos (Xtensa devices use single timer)
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let timer0: AnyTimer = timg0.timer0.into();
     esp_rtos::start(timer0);
@@ -716,12 +375,238 @@ async fn main(spawner: Spawner) -> ! {
     info!("WiFi controller initialized");
 
     let (wifi_controller, interfaces) =
-        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Config::default())
+        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default())
             .expect("Failed to create WiFi interface");
 
     // Extract the station interface for WiFi operations
     let _wifi_interface = interfaces.sta;
     info!("WiFi controller initialized with station interface");
+
+    // Initialize display hardware using PROVEN timing from Conway's implementation
+    info!("=== Starting ESoPe Board Display Initialization ===");
+
+    // Read display configuration from EEPROM
+    let i2c = I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
+        .unwrap()
+        .with_sda(peripherals.GPIO1)
+        .with_scl(peripherals.GPIO41);
+    let i2c_bus = I2C_BUS.init(RefCell::new(i2c));
+    let mut eeid = [0u8; 0x1c];
+    let mut eeprom = Eeprom24x::new_24x01(RefCellDevice::new(i2c_bus), SlaveAddr::default());
+    eeprom.read_data(0x00, &mut eeid).unwrap();
+    let display_width = u16::from_be_bytes([eeid[8], eeid[9]]);
+    let display_height = u16::from_be_bytes([eeid[10], eeid[11]]);
+    info!(
+        "Display size from EEPROM: {}x{}",
+        display_width, display_height
+    );
+
+    // Use hardcoded display size if EEPROM is empty or invalid
+    let actual_display_width = if display_width == 0 {
+        320
+    } else {
+        display_width
+    };
+    let actual_display_height = if display_height == 0 {
+        240
+    } else {
+        display_height
+    };
+    info!(
+        "Using display size: {}x{}",
+        actual_display_width, actual_display_height
+    );
+
+    // Enable panel / backlight
+    let mut panel_enable = Output::new(peripherals.GPIO42, Level::Low, OutputConfig::default());
+    panel_enable.set_high();
+
+    let mut backlight = Output::new(peripherals.GPIO39, Level::Low, OutputConfig::default());
+    backlight.set_high();
+
+    let mut _touch_reset = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
+
+    // Add a delay to ensure the display power is stable
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+
+    info!("Display initialized, setting up dual-core rendering...");
+
+    // **KEY FIX**: Allocate framebuffer in PSRAM following Conway's approach
+    let mut fb_box: Box<[Rgb565; LCD_BUFFER_SIZE]> =
+        Box::new([Rgb565::new(0, 0, 0); LCD_BUFFER_SIZE]);
+
+    // Create test pattern first to verify display works
+    for i in 0..LCD_BUFFER_SIZE {
+        let x = i % LCD_H_RES_USIZE;
+        let y = i / LCD_H_RES_USIZE;
+        // Create a simple test pattern - gradient from green to blue
+        let g = (x * 63 / LCD_H_RES_USIZE) as u8;
+        let b = (y * 31 / LCD_V_RES_USIZE) as u8;
+        fb_box[i] = Rgb565::new(0, g, b);
+    }
+    info!("Test pattern written to framebuffer");
+
+    let fb_ptr: *mut Rgb565 = fb_box.as_mut_ptr();
+    let psram_buf: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(fb_ptr as *mut u8, FRAME_BYTES) };
+
+    // Verify PSRAM buffer allocation and alignment (CRITICAL!)
+    let buf_ptr = psram_buf.as_ptr() as usize;
+    info!("PSRAM buffer allocated at address: 0x{:08X}", buf_ptr);
+    info!("PSRAM buffer length: {}", psram_buf.len());
+    info!("PSRAM buffer alignment modulo 64: {}", buf_ptr % 64);
+    assert!(
+        buf_ptr % 64 == 0,
+        "PSRAM buffer must be 64-byte aligned for DMA"
+    );
+
+    // Publish PSRAM buffer pointer and len for other cores
+    unsafe {
+        PSRAM_BUF_PTR = psram_buf.as_mut_ptr();
+        PSRAM_BUF_LEN = psram_buf.len();
+    }
+
+    // Configure DMA buffer with proper burst configuration (following Conway)
+    let dma_tx: DmaTxBuf = unsafe {
+        DmaTxBuf::new_with_config(
+            &mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS),
+            psram_buf,
+            ExternalBurstConfig::Size64,
+        )
+        .unwrap()
+    };
+
+    // Initialize LCD DPI interface with PROVEN TIMING from Conway's implementation
+    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
+
+    // Read configuration from EEPROM
+    let pclk_hz = ((eeid[12] as u32) * 1_000_000 + (eeid[13] as u32) * 100_000).min(13_600_000);
+    let flags = eeid[25];
+    let hsync_idle_low = (flags & 0x01) != 0;
+    let vsync_idle_low = (flags & 0x02) != 0;
+    let de_idle_high = (flags & 0x04) != 0;
+    let pclk_active_neg = (flags & 0x20) != 0;
+
+    // Use safe defaults if EEPROM values are invalid
+    let actual_pclk_hz = if pclk_hz == 0 { 10_000_000 } else { pclk_hz }; // 10MHz default
+
+    // Log display configuration
+    info!("Display configuration:");
+    info!("  EEPROM Resolution: {}x{}", display_width, display_height);
+    info!(
+        "  Actual Resolution: {}x{}",
+        actual_display_width, actual_display_height
+    );
+    info!("  EEPROM PCLK: {} Hz", pclk_hz);
+    info!("  Actual PCLK: {} Hz", actual_pclk_hz);
+    info!("  Flags: 0x{:02X}", flags);
+    info!("  HSYNC idle low: {}", hsync_idle_low);
+    info!("  VSYNC idle low: {}", vsync_idle_low);
+    info!("  DE idle high: {}", de_idle_high);
+    info!("  PCLK active neg: {}", pclk_active_neg);
+
+    // Use EXACT timing from Conway's working implementation
+    let dpi_config = DpiConfig::default()
+        .with_clock_mode(ClockMode {
+            polarity: if pclk_active_neg {
+                Polarity::IdleHigh
+            } else {
+                Polarity::IdleLow
+            },
+            phase: if pclk_active_neg {
+                Phase::ShiftHigh
+            } else {
+                Phase::ShiftLow
+            },
+        })
+        .with_frequency(Rate::from_hz(actual_pclk_hz))
+        .with_format(Format {
+            enable_2byte_mode: true,
+            ..Default::default()
+        })
+        .with_timing(FrameTiming {
+            horizontal_active_width: 320,
+            horizontal_total_width: 320 + 4 + 43 + 79 + 8, // =446 (Conway's working value)
+            horizontal_blank_front_porch: 79 + 8,          // was 47, add 32px
+            vertical_active_height: 240,
+            vertical_total_height: 240 + 4 + 12 + 16, // increased blank front porch to 16
+            vertical_blank_front_porch: 16,
+            hsync_width: 4,
+            vsync_width: 4,
+            hsync_position: 43 + 4, // (= back_porch + pulse = 47) Conway's working value
+        })
+        .with_vsync_idle_level(if vsync_idle_low {
+            Level::Low
+        } else {
+            Level::High
+        })
+        .with_hsync_idle_level(if hsync_idle_low {
+            Level::Low
+        } else {
+            Level::High
+        })
+        .with_de_idle_level(if de_idle_high {
+            Level::High
+        } else {
+            Level::Low
+        })
+        .with_disable_black_region(false);
+
+    let dpi = Dpi::new(lcd_cam.lcd, peripherals.DMA_CH2, dpi_config)
+        .unwrap()
+        .with_vsync(peripherals.GPIO6)
+        .with_hsync(peripherals.GPIO15)
+        .with_de(peripherals.GPIO5)
+        .with_pclk(peripherals.GPIO4)
+        // Blue bus
+        .with_data0(peripherals.GPIO9)
+        .with_data1(peripherals.GPIO17)
+        .with_data2(peripherals.GPIO46)
+        .with_data3(peripherals.GPIO16)
+        .with_data4(peripherals.GPIO7)
+        // Green bus
+        .with_data5(peripherals.GPIO8)
+        .with_data6(peripherals.GPIO21)
+        .with_data7(peripherals.GPIO3)
+        .with_data8(peripherals.GPIO11)
+        .with_data9(peripherals.GPIO18)
+        .with_data10(peripherals.GPIO10)
+        // Red bus
+        .with_data11(peripherals.GPIO14)
+        .with_data12(peripherals.GPIO20)
+        .with_data13(peripherals.GPIO13)
+        .with_data14(peripherals.GPIO19)
+        .with_data15(peripherals.GPIO12);
+
+    // Prepare RNG for app core task
+    let rng_for_app = Rng::new();
+
+    // Split peripherals for multicore usage
+    let (dpi_for_display, _) = (dpi, rng_for_app);
+
+    // Signal that PSRAM is ready
+    PSRAM_READY.signal(());
+
+    // Initialize software interrupts for multicore support (following Conway)
+    let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+
+    // **CRITICAL**: Start app core with esp-rtos (Conway's approach)
+    let app_core_stack = APP_CORE_STACK.init(Stack::new());
+    esp_rtos::start_second_core(
+        peripherals.CPU_CTRL,
+        sw_ints.software_interrupt0,
+        sw_ints.software_interrupt1,
+        app_core_stack,
+        move || {
+            static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+            let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
+            executor.run(|spawner| {
+                spawner
+                    .spawn(dma_display_task(dpi_for_display, dma_tx))
+                    .ok();
+            });
+        },
+    );
 
     // Create custom Slint window and backend
     let window = slint::platform::software_renderer::MinimalSoftwareWindow::new(
@@ -791,490 +676,30 @@ async fn main(spawner: Spawner) -> ! {
     // Store UI reference for automatic refresh
     let ui_for_refresh = ui.as_weak();
 
-    // Spawn WiFi scanning task
-    info!("Spawning WiFi scan task");
+    // **Core 0**: Spawn WiFi tasks
+    info!("Spawning WiFi scan task on Core 0");
     spawner.spawn(wifi_scan_task(wifi_controller)).ok();
 
-    // Spawn automatic WiFi UI refresh task
-    info!("Spawning automatic WiFi refresh task");
+    info!("Spawning automatic WiFi refresh task on Core 0");
     spawner.spawn(auto_wifi_refresh_task(ui_for_refresh)).ok();
+
+    // **Core 0**: Spawn Slint rendering task
+    info!("Spawning Slint rendering task on Core 0");
+    spawner
+        .spawn(slint_rendering_task(window.clone(), ui.as_weak()))
+        .ok();
 
     // Show the window
     ui.show().unwrap();
 
-    // Initialize display hardware and start dual-core rendering pipeline
-    info!("=== Starting ESoPe Board Dual-Core Event Loop ===");
-    info!("Initializing ESoPe display hardware...");
+    info!("=== All systems initialized, dual-core active ===");
+    info!("Core 0: WiFi + Slint rendering");
+    info!("Core 1: DMA display output");
 
-    // Read and set up the display configuration from EEPROM
-    let i2c = I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
-        .unwrap()
-        .with_sda(peripherals.GPIO1)
-        .with_scl(peripherals.GPIO41);
-    let i2c_bus = I2C_BUS.init(RefCell::new(i2c));
-    let mut eeid = [0u8; 0x1c];
-    let mut eeprom = Eeprom24x::new_24x01(RefCellDevice::new(i2c_bus), SlaveAddr::default());
-    eeprom.read_data(0x00, &mut eeid).unwrap();
-    let display_width = u16::from_be_bytes([eeid[8], eeid[9]]);
-    let display_height = u16::from_be_bytes([eeid[10], eeid[11]]);
-    info!(
-        "Display size from EEPROM: {}x{}",
-        display_width, display_height
-    );
-
-    // Use hardcoded display size if EEPROM is empty or invalid
-    let actual_display_width = if display_width == 0 {
-        LCD_H_RES
-    } else {
-        display_width
-    };
-    let actual_display_height = if display_height == 0 {
-        LCD_V_RES
-    } else {
-        display_height
-    };
-    info!(
-        "Using display size: {}x{}",
-        actual_display_width, actual_display_height
-    );
-
-    // Initialize touch controller using shared I2C bus
-    info!("Initializing touch controller...");
-    let touch_device = RefCellDevice::new(i2c_bus);
-    let mut touch_controller = sitronix_touch::TouchIC::new_default(touch_device);
-    match touch_controller.init() {
-        Ok(_) => info!("Touch controller initialized successfully"),
-        Err(e) => {
-            error!("Failed to initialize touch controller: {:?}", e);
-            // Continue without touch support
-        }
-    }
-
-    // Enable panel / backlight
-    let mut panel_enable = Output::new(peripherals.GPIO42, Level::Low, OutputConfig::default());
-    panel_enable.set_high();
-
-    let mut backlight = Output::new(peripherals.GPIO39, Level::Low, OutputConfig::default());
-    backlight.set_high();
-
-    let mut _touch_reset = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
-
-    info!("Display initialized, setting up dual-core rendering...");
-
-    // Allocate framebuffer in PSRAM with 64-byte alignment for DMA
-    const FRAME_BYTES: usize = LCD_BUFFER_SIZE * 2;
-
-    // Use aligned allocation for DMA requirements
-    let layout =
-        Layout::from_size_align(FRAME_BYTES, 64).expect("Failed to create layout for framebuffer");
-    let fb_ptr = unsafe { alloc(layout) };
-
-    if fb_ptr.is_null() {
-        handle_alloc_error(layout);
-    }
-
-    // Initialize the buffer
-    let fb_slice = unsafe { core::slice::from_raw_parts_mut(fb_ptr, FRAME_BYTES) };
-    let psram_buf: &'static mut [u8] = fb_slice;
-
-    // Verify PSRAM buffer allocation and alignment
-    let buf_ptr = psram_buf.as_ptr() as usize;
-    info!("PSRAM buffer allocated at address: 0x{:08X}", buf_ptr);
-    info!("PSRAM buffer length: {}", psram_buf.len());
-    info!("PSRAM buffer alignment modulo 64: {}", buf_ptr % 64);
-    assert!(
-        buf_ptr % 64 == 0,
-        "PSRAM buffer must be 64-byte aligned for DMA"
-    );
-
-    // Publish PSRAM buffer pointer and len for app core
-    unsafe {
-        PSRAM_BUF_PTR = psram_buf.as_mut_ptr();
-        PSRAM_BUF_LEN = psram_buf.len();
-    }
-
-    // Configure DMA buffer with proper burst configuration
-    info!("=== DMA Buffer Configuration ===");
-    let dma_tx: DmaTxBuf = unsafe {
-        DmaTxBuf::new_with_config(
-            &mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS),
-            psram_buf,
-            ExternalBurstConfig::Size64,
-        )
-        .unwrap()
-    };
-
-    // Initialize LCD DPI interface
-    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
-
-    // Read configuration from EEPROM
-    let pclk_hz = ((eeid[12] as u32) * 1_000_000 + (eeid[13] as u32) * 100_000).min(13_600_000);
-    let flags = eeid[25];
-    let hsync_idle_low = (flags & 0x01) != 0;
-    let vsync_idle_low = (flags & 0x02) != 0;
-    let de_idle_high = (flags & 0x04) != 0;
-    let pclk_active_neg = (flags & 0x20) != 0;
-
-    // Use safe defaults if EEPROM values are invalid
-    let actual_pclk_hz = if pclk_hz == 0 { 10_000_000 } else { pclk_hz }; // 10MHz default
-
-    // Log display configuration
-    info!("Display configuration:");
-    info!("  EEPROM Resolution: {}x{}", display_width, display_height);
-    info!(
-        "  Actual Resolution: {}x{}",
-        actual_display_width, actual_display_height
-    );
-    info!("  EEPROM PCLK: {} Hz", pclk_hz);
-    info!("  Actual PCLK: {} Hz", actual_pclk_hz);
-    info!("  Flags: 0x{:02X}", flags);
-    info!("  HSYNC idle low: {}", hsync_idle_low);
-    info!("  VSYNC idle low: {}", vsync_idle_low);
-    info!("  DE idle high: {}", de_idle_high);
-    info!("  PCLK active neg: {}", pclk_active_neg);
-
-    let dpi_config = DpiConfig::default()
-        .with_clock_mode(ClockMode {
-            polarity: if pclk_active_neg {
-                Polarity::IdleHigh
-            } else {
-                Polarity::IdleLow
-            },
-            phase: if pclk_active_neg {
-                Phase::ShiftHigh
-            } else {
-                Phase::ShiftLow
-            },
-        })
-        .with_frequency(Rate::from_hz(actual_pclk_hz))
-        .with_format(Format {
-            enable_2byte_mode: true,
-            ..Default::default()
-        })
-        .with_timing(FrameTiming {
-            horizontal_active_width: 320,
-            horizontal_total_width: 320 + 4 + 43 + 79 + 8, // =446
-            horizontal_blank_front_porch: 79 + 8,
-            vertical_active_height: 240,
-            vertical_total_height: 240 + 4 + 12 + 16,
-            vertical_blank_front_porch: 16,
-            hsync_width: 4,
-            vsync_width: 4,
-            hsync_position: 43 + 4,
-        })
-        .with_vsync_idle_level(if vsync_idle_low {
-            Level::Low
-        } else {
-            Level::High
-        })
-        .with_hsync_idle_level(if hsync_idle_low {
-            Level::Low
-        } else {
-            Level::High
-        })
-        .with_de_idle_level(if de_idle_high {
-            Level::High
-        } else {
-            Level::Low
-        })
-        .with_disable_black_region(false);
-
-    let dpi = Dpi::new(lcd_cam.lcd, peripherals.DMA_CH2, dpi_config)
-        .unwrap()
-        .with_vsync(peripherals.GPIO6)
-        .with_hsync(peripherals.GPIO15)
-        .with_de(peripherals.GPIO5)
-        .with_pclk(peripherals.GPIO4)
-        // Blue bus
-        .with_data0(peripherals.GPIO9)
-        .with_data1(peripherals.GPIO17)
-        .with_data2(peripherals.GPIO46)
-        .with_data3(peripherals.GPIO16)
-        .with_data4(peripherals.GPIO7)
-        // Green bus
-        .with_data5(peripherals.GPIO8)
-        .with_data6(peripherals.GPIO21)
-        .with_data7(peripherals.GPIO3)
-        .with_data8(peripherals.GPIO11)
-        .with_data9(peripherals.GPIO18)
-        .with_data10(peripherals.GPIO10)
-        // Red bus
-        .with_data11(peripherals.GPIO14)
-        .with_data12(peripherals.GPIO20)
-        .with_data13(peripherals.GPIO13)
-        .with_data14(peripherals.GPIO19)
-        .with_data15(peripherals.GPIO12);
-
-    // Signal that PSRAM is ready for the app core
-    info!("Signaling PSRAM ready for app core...");
-    PSRAM_READY.signal(());
-
-    // Spawn app core for DMA display task (Core 1)
-    info!("=== App Core Startup ===");
-    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
-    info!("Starting app core (Core 1) for DMA display task...");
-    let _app_core = cpu_control.start_app_core(
-        unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) },
-        move || {
-            info!("App core started! Initializing Embassy executor on Core 1...");
-
-            // Initialize and run Embassy executor on app core
-            static APP_EXECUTOR: StaticCell<Executor> = StaticCell::new();
-            let executor = APP_EXECUTOR.init(Executor::new());
-            info!("App core executor initialized, spawning DMA task...");
-
-            executor.run(
-                |spawner| match spawner.spawn(dma_display_task(dpi, dma_tx)) {
-                    Ok(_) => info!("DMA display task spawned successfully on Core 1"),
-                    Err(e) => error!("Failed to spawn DMA display task: {:?}", e),
-                },
-            );
-        },
-    );
-
-    // Spawn Slint rendering task on Core 0
-    info!("Spawning Slint rendering task on Core 0");
-    spawner
-        .spawn(slint_rendering_task(window.clone(), touch_controller))
-        .ok();
-
-    info!("=== All systems initialized, entering main loop ===");
-
-    // Main loop - keep the main task alive and handle periodic WiFi UI updates
-    let mut ticker = Ticker::every(Duration::from_secs(1));
+    // Main loop - keep the main task alive (Core 0)
+    let mut ticker = Ticker::every(Duration::from_secs(5));
     loop {
         ticker.next().await;
-
-        // Check for WiFi updates and trigger UI refresh periodically
-        if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
-            // The UI refresh is handled in the refresh callback
-            debug!("WiFi scan results available for UI update");
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn slint_rendering_task(
-    window: Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
-    mut touch_controller: TouchController,
-) {
-    info!("[CORE 1] Slint task starting, waiting for PSRAM ready signal...");
-
-    // Wait for PSRAM to be ready
-    PSRAM_READY.wait().await;
-    info!("[CORE 1] PSRAM ready signal received!");
-
-    // Get the PSRAM buffer
-    let psram_ptr = unsafe { PSRAM_BUF_PTR };
-    let psram_len = unsafe { PSRAM_BUF_LEN };
-
-    if psram_ptr.is_null() || psram_len == 0 {
-        error!(
-            "[CORE 1] Invalid PSRAM buffer: ptr=0x{:08X}, len={}",
-            psram_ptr as usize, psram_len
-        );
-        return;
-    }
-
-    let fb_slice: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(psram_ptr, psram_len) };
-
-    info!(
-        "[CORE 1] Slint task started on Core 1, PSRAM buffer at: 0x{:08X}, len: {}",
-        psram_ptr as usize, psram_len
-    );
-
-    // Create pixel buffer for Slint rendering in PSRAM (using Box allocation)
-    info!("[CORE 1] Creating pixel buffer in PSRAM...");
-    let mut pixel_box: Box<[Rgb565Pixel; LCD_BUFFER_SIZE]> =
-        Box::new([Rgb565Pixel(0); LCD_BUFFER_SIZE]);
-    let pixel_buf: &mut [Rgb565Pixel] = &mut *pixel_box;
-    info!(
-        "[CORE 1] Pixel buffer created in PSRAM, {} pixels",
-        LCD_BUFFER_SIZE
-    );
-
-    // Signal that DMA is ready to be used now that everything is initialized
-    info!("[CORE 1] Signaling DMA ready for Core 0...");
-    DMA_READY.signal(());
-
-    let mut ticker = Ticker::every(Duration::from_millis(200));
-    let mut frame_counter = 0u32;
-    let mut last_position = slint::LogicalPosition::default();
-    let mut touch_down = false;
-
-    info!("[CORE 1] Entering main rendering loop with Slint rendering and touch support...");
-
-    loop {
-        // Update Slint timers and animations
-        slint::platform::update_timers_and_animations();
-
-        // Poll touch controller for input events
-        if let Ok(maybe_touch) = touch_controller.get_point0() {
-            if let Some(sitronix_touch::Point {
-                x: touchpad_x,
-                y: touchpad_y,
-            }) = maybe_touch
-            {
-                last_position = slint::LogicalPosition::new(touchpad_x as f32, touchpad_y as f32);
-
-                // Dispatch the pointer moved event
-                window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
-                    position: last_position,
-                });
-
-                if !touch_down {
-                    window.dispatch_event(slint::platform::WindowEvent::PointerPressed {
-                        position: last_position,
-                        button: slint::platform::PointerEventButton::Left,
-                    });
-                    if frame_counter % 60 == 0 {
-                        debug!("[CORE 1] Touch pressed at ({}, {})", touchpad_x, touchpad_y);
-                    }
-                }
-
-                touch_down = true;
-            } else if touch_down {
-                window.dispatch_event(slint::platform::WindowEvent::PointerReleased {
-                    position: last_position,
-                    button: slint::platform::PointerEventButton::Left,
-                });
-                window.dispatch_event(slint::platform::WindowEvent::PointerExited);
-                touch_down = false;
-
-                if frame_counter % 60 == 0 {
-                    debug!("[CORE 1] Touch released");
-                }
-            }
-        }
-
-        // Use draw_if_needed to check if we need to render and get access to the renderer
-        let rendered = window.draw_if_needed(|renderer| {
-            // Render the Slint window to our pixel buffer
-            // Slint will handle partial rendering and only update the areas that changed
-            renderer.render(pixel_buf, LCD_H_RES as usize);
-
-            if frame_counter % 60 == 0 {
-                debug!("[CORE 1] Frame {} rendered by Slint", frame_counter);
-            }
-        });
-
-        // Only convert and signal if something was actually rendered
-        if rendered {
-            // Convert pixel buffer to framebuffer
-            for (i, px) in pixel_buf.iter().enumerate() {
-                let fb_offset = i * 2;
-                let [lo, hi] = px.0.to_le_bytes();
-                fb_slice[fb_offset] = lo;
-                fb_slice[fb_offset + 1] = hi;
-            }
-
-            if frame_counter % 60 == 0 {
-                debug!(
-                    "[CORE 1] Frame {} actually rendered by Slint",
-                    frame_counter
-                );
-            }
-        } else {
-            // Still convert buffer even if nothing was rendered (for first frame or fallback)
-            for (i, px) in pixel_buf.iter().enumerate() {
-                let fb_offset = i * 2;
-                let [lo, hi] = px.0.to_le_bytes();
-                fb_slice[fb_offset] = lo;
-                fb_slice[fb_offset + 1] = hi;
-            }
-
-            if frame_counter % 60 == 0 {
-                debug!(
-                    "[CORE 1] Frame {} - no Slint rendering needed",
-                    frame_counter
-                );
-            }
-        }
-
-        // Signal that frame is ready for DMA
-        FRAME_READY.signal(());
-
-        frame_counter = frame_counter.wrapping_add(1);
-
-        // Log periodic status
-        if frame_counter % 60 == 0 {
-            debug!(
-                "[CORE 1] Frame {}, continuing render loop...",
-                frame_counter
-            );
-        }
-
-        ticker.next().await;
-    }
-}
-
-#[embassy_executor::task]
-async fn dma_display_task(mut dpi: Dpi<'static, esp_hal::Blocking>, mut dma_tx: DmaTxBuf) {
-    info!("[CORE 0] DMA task started on Core 0, waiting for DMA ready signal...");
-
-    // Wait for DMA to be ready (all initialization complete)
-    DMA_READY.wait().await;
-    info!("[CORE 0] DMA ready signal received, starting DMA transfers!");
-
-    let mut transfer_counter = 0u32;
-    // Wait for frame to be ready
-    FRAME_READY.wait().await;
-    loop {
-        transfer_counter = transfer_counter.wrapping_add(1);
-
-        // Log periodic DMA status
-        if transfer_counter % 60 == 0 {
-            debug!(
-                "[CORE 0] DMA transfer {}, performing transfer...",
-                transfer_counter
-            );
-        }
-
-        // Set DMA transfer length (like Conway's working example)
-        let frame_bytes = LCD_BUFFER_SIZE * 2;
-        let dma_buf_len = dma_tx.as_slice().len();
-
-        if transfer_counter % 60 == 0 {
-            debug!(
-                "[CORE 0] Setting DMA length: {} bytes, buffer len: {} bytes",
-                frame_bytes, dma_buf_len
-            );
-        }
-
-        if frame_bytes > dma_buf_len {
-            error!(
-                "[CORE 0] Frame size {} exceeds DMA buffer size {}",
-                frame_bytes, dma_buf_len
-            );
-            Timer::after(Duration::from_millis(10)).await;
-            continue;
-        }
-
-        dma_tx.set_length(frame_bytes);
-
-        // Perform DMA transfer
-        match dpi.send(false, dma_tx) {
-            Ok(xfer) => {
-                let (res, new_dpi, new_dma_tx) = xfer.wait();
-                dpi = new_dpi;
-                dma_tx = new_dma_tx;
-                if let Err(e) = res {
-                    error!("[CORE 0] DMA transfer error: {:?}", e);
-                } else if transfer_counter % 60 == 0 {
-                    debug!(
-                        "[CORE 0] DMA transfer {} completed successfully",
-                        transfer_counter
-                    );
-                }
-            }
-            Err((e, new_dpi, new_dma_tx)) => {
-                error!("[CORE 0] DMA send error: {:?}", e);
-                dpi = new_dpi;
-                dma_tx = new_dma_tx;
-
-                // Add small delay on error to prevent spinning
-                Timer::after(Duration::from_millis(100)).await;
-            }
-        }
+        info!("Main task alive - WiFi scanning and Slint rendering on Core 0");
     }
 }
