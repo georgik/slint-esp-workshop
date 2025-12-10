@@ -193,24 +193,11 @@ pub fn init_display_hardware(
     .with_sda(gpio8)
     .with_scl(gpio18);
 
-    info!("Attempting to initialize touch at primary address 0x14");
-    let mut touch = Gt911Blocking::new(0x14);
-
-    match touch.init(&mut i2c) {
-        Ok(_) => info!("Touch initialized at primary address"),
-        Err(e) => {
-            warn!("Touch initialization failed at primary address: {:?}", e);
-            info!("Attempting to initialize touch at backup address 0x5D");
-            let touch_fallback = Gt911Blocking::new(0x5D);
-            match touch_fallback.init(&mut i2c) {
-                Ok(_) => {
-                    info!("Touch initialized at backup address");
-                    touch = touch_fallback;
-                }
-                Err(e) => error!("Touch initialization failed at backup address: {:?}", e),
-            }
-        }
-    }
+    // TODO: Fix touch initialization - it's blocking the application
+    // Temporarily disabled to test WiFi functionality
+    info!("Touch initialization temporarily disabled to prevent blocking");
+    let mut touch = Gt911Blocking::new(0x5D); // Use backup address directly
+    info!("Touch controller created (not initialized)");
 
     // Store components globally for the platform to use
     DISPLAY_COMPONENTS.set(DisplayHardware {
