@@ -29,6 +29,19 @@ use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::logger::init_logger_from_env;
 
+// Heap statistics function
+fn report_heap_stats(context: &str) {
+    let used = esp_alloc::HEAP.used();
+    let free = esp_alloc::HEAP.free();
+    info!(
+        "[HEAP STATS] {}: Used: {} bytes, Free: {} bytes, Total: {} bytes",
+        context,
+        used,
+        free,
+        used + free
+    );
+}
+
 // Display imports
 use display::{DISPLAY_COMPONENTS, HardwareDrawBuffer};
 
@@ -101,6 +114,7 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     // Initialize IRAM heap for WiFi and small allocations
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
+    esp_alloc::heap_allocator!(size: 90 * 1024);
 
     // Initialize PSRAM heap for large allocations like framebuffer using esp-hal 1.0.0 macro
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
@@ -109,6 +123,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     // Initialize logger
     init_logger_from_env();
     info!("Peripherals initialized");
+
+    // Report initial heap statistics
+    report_heap_stats("After heap initialization");
 
     info!("Starting Slint ESP32-S3 Workshop");
 
@@ -132,6 +149,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     let _wifi_interface = interfaces.sta;
     info!("WiFi controller initialized with station interface");
 
+    // Report heap statistics after WiFi initialization
+    report_heap_stats("After WiFi initialization");
+
     // Initialize display hardware with specific peripherals AFTER WiFi is set up
     display::init_display_hardware(
         peripherals.GPIO3,
@@ -147,6 +167,9 @@ async fn main(spawner: embassy_executor::Spawner) {
         peripherals.I2C0,
     )
     .expect("Failed to initialize display hardware");
+
+    // Report heap statistics after display initialization (framebuffer allocation)
+    report_heap_stats("After display initialization");
 
     // Store WiFi controller for the render loop task
     let wifi_ctrl = wifi_controller;
@@ -415,6 +438,9 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
 
     // Check WiFi capabilities
     info!("WiFi capabilities: {:?}", wifi_controller.capabilities());
+
+    // Report heap statistics after WiFi scanning task starts
+    report_heap_stats("After WiFi scanning task spawn");
 
     // Configure WiFi as Client (following esope-sld-c-w-s3 working pattern)
     let client_config = ModeConfig::Client(ClientConfig::default());
