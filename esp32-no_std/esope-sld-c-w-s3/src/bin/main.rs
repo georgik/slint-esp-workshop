@@ -22,7 +22,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::mutex::Mutex;
 use esp_radio::wifi::{
-    AccessPointInfo, ClientConfig, ModeConfig, ScanConfig, WifiController, WifiError,
+    AccessPointInfo, ClientConfig, Config, ModeConfig, ScanConfig, WifiController, WifiError,
 };
 
 use eeprom24x::{Eeprom24x, SlaveAddr};
@@ -62,6 +62,19 @@ use static_cell::StaticCell;
 fn panic(info: &core::panic::PanicInfo) -> ! {
     error!("PANIC: {}", info);
     loop {}
+}
+
+// Heap statistics function
+fn report_heap_stats(context: &str) {
+    let used = esp_alloc::HEAP.used();
+    let free = esp_alloc::HEAP.free();
+    info!(
+        "[HEAP STATS] {}: Used: {} bytes, Free: {} bytes, Total: {} bytes",
+        context,
+        used,
+        free,
+        used + free
+    );
 }
 
 extern crate alloc;
@@ -554,7 +567,13 @@ async fn auto_wifi_refresh_task(ui_weak: slint::Weak<MainWindow>) {
 async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     info!("=== WiFi scan task started ====");
 
-    // Start WiFi
+    // Check WiFi capabilities
+    info!("WiFi capabilities: {:?}", wifi_controller.capabilities());
+
+    // Report heap statistics after WiFi scanning task starts
+    report_heap_stats("After WiFi scanning task spawn");
+
+    // Configure WiFi as Client (following working pattern)
     let client_config = ModeConfig::Client(ClientConfig::default());
 
     match wifi_controller.set_config(&client_config) {
@@ -661,8 +680,20 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
     // Initialize BOTH heap allocators - WiFi first in internal RAM, then PSRAM for GUI
-    esp_alloc::heap_allocator!(size: 180 * 1024);
+    // Initialize IRAM heap for WiFi and small allocations
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
+    esp_alloc::heap_allocator!(size: 90 * 1024);
+
+    // Initialize PSRAM heap for large allocations like framebuffer using esp-hal 1.0.0 macro
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    info!("PSRAM heap initialized using psram_allocator! macro");
+
+    // Initialize logger
+    init_logger_from_env();
+    info!("Peripherals initialized");
+
+    // Report initial heap statistics
+    report_heap_stats("After heap initialization");
 
     // Initialize embassy timer BEFORE esp_radio::init()
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -684,10 +715,13 @@ async fn main(spawner: Spawner) -> ! {
     );
     info!("WiFi controller initialized");
 
-    let (wifi_controller, _interfaces) =
-        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default())
+    let (wifi_controller, interfaces) =
+        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Config::default())
             .expect("Failed to create WiFi interface");
-    info!("WiFi interface created");
+
+    // Extract the station interface for WiFi operations
+    let _wifi_interface = interfaces.sta;
+    info!("WiFi controller initialized with station interface");
 
     // Create custom Slint window and backend
     let window = slint::platform::software_renderer::MinimalSoftwareWindow::new(

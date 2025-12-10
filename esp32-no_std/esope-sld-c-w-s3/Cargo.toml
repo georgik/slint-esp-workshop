@@ -39,9 +39,18 @@ esp-hal = { version = "1.0.0", features = ["esp32s3", "unstable", "psram"] }
 esp-alloc = "0.9.0"
 esp-backtrace = { version = "0.17.0", features = ["esp32s3", "exception-handler", "println"] }
 heapless = { version = "0.8.0", default-features = false }
-embedded-io = "0.6.1"
+embedded-io = "0.7.1"
+embedded-io-async = "0.7.0"
 sitronix-touch = "0.0.1"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-dhcpv4",
+    "proto-dns",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }
 
 [profile.dev]
 # Rust debug is too slow.
