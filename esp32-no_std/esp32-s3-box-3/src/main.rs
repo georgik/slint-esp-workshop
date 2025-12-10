@@ -12,6 +12,8 @@ use alloc::vec;
 use core::panic::PanicInfo;
 use log::{debug, error, info};
 
+esp_bootloader_esp_idf::esp_app_desc!();
+
 // WiFi imports - simplified
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;

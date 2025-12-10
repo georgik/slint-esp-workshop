@@ -1,16 +1,17 @@
 fn main() {
     // Build Slint UI files
     println!("cargo:rerun-if-changed=appwindow.slint");
-    println!("cargo:rerun-if-changed=../ui/widgets.slint");
-    println!("cargo:rerun-if-changed=../ui/viewmodel.slint");
+    println!("cargo:rerun-if-changed=ui/widgets.slint");
+    println!("cargo:rerun-if-changed=ui/viewmodel.slint");
+    println!("cargo:rerun-if-changed=ui/pages.slint");
+    println!("cargo:rerun-if-changed=ui/style.slint");
+    println!("cargo:rerun-if-changed=ui/wifi_list.slint");
 
     let config = slint_build::CompilerConfiguration::new()
         .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
     slint_build::compile_with_config("appwindow.slint", config).unwrap();
 
     linker_be_nice();
-    // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
-    println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
 
 fn linker_be_nice() {
