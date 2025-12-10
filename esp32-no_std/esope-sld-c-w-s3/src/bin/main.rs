@@ -49,6 +49,10 @@ use static_cell::StaticCell;
 // Static storage for I2C bus
 static I2C_BUS: StaticCell<RefCell<I2c<'static, esp_hal::Blocking>>> = StaticCell::new();
 
+// Type alias for I2C device to simplify signatures
+type I2cDevice = RefCellDevice<'static, esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>;
+type TouchController = sitronix_touch::TouchIC<I2cDevice>;
+
 // FrameBufferBackend wrapper for a PSRAM-backed [Rgb565; N] slice.
 pub struct PSRAMFrameBuffer<'a> {
     buf: &'a mut [Rgb565; LCD_BUFFER_SIZE],
@@ -261,6 +265,7 @@ async fn dma_display_task(mut dpi: Dpi<'static, esp_hal::Blocking>, mut dma_tx: 
 async fn slint_rendering_task(
     window: Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
     ui: slint::Weak<MainWindow>,
+    mut touch_controller: TouchController,
 ) {
     info!("[CORE 0] Slint rendering task started");
 
@@ -282,11 +287,52 @@ async fn slint_rendering_task(
         unsafe { &mut *(psram_ptr as *mut [Rgb565; LCD_BUFFER_SIZE]) };
 
     let mut frame_counter = 0u32;
+    let mut last_position = slint::LogicalPosition::default();
+    let mut touch_down = false;
 
     let mut ticker = Ticker::every(Duration::from_millis(16)); // ~60fps
     loop {
         // Update Slint timers and animations
         slint::platform::update_timers_and_animations();
+
+        // Poll touch controller for input events
+        if let Ok(maybe_touch) = touch_controller.get_point0() {
+            if let Some(sitronix_touch::Point {
+                x: touchpad_x,
+                y: touchpad_y,
+            }) = maybe_touch
+            {
+                last_position = slint::LogicalPosition::new(touchpad_x as f32, touchpad_y as f32);
+
+                // Dispatch the pointer moved event
+                window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                    position: last_position,
+                });
+
+                if !touch_down {
+                    window.dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                        position: last_position,
+                        button: slint::platform::PointerEventButton::Left,
+                    });
+                    if frame_counter % 60 == 0 {
+                        debug!("[CORE 0] Touch pressed at ({}, {})", touchpad_x, touchpad_y);
+                    }
+                }
+
+                touch_down = true;
+            } else if touch_down {
+                window.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                    position: last_position,
+                    button: slint::platform::PointerEventButton::Left,
+                });
+                window.dispatch_event(slint::platform::WindowEvent::PointerExited);
+                touch_down = false;
+
+                if frame_counter % 60 == 0 {
+                    debug!("[CORE 0] Touch released");
+                }
+            }
+        }
 
         // Check for new WiFi scan results and trigger UI refresh if available
         if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
@@ -428,6 +474,18 @@ async fn main(spawner: Spawner) {
 
     // Add a delay to ensure the display power is stable
     embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+
+    // Initialize touch controller using the same I2C bus
+    info!("Initializing touch controller...");
+    let touch_device = RefCellDevice::new(i2c_bus);
+    let mut graphics_touch_controller = sitronix_touch::TouchIC::new_default(touch_device);
+    match graphics_touch_controller.init() {
+        Ok(_) => info!("Touch controller initialized successfully"),
+        Err(e) => {
+            error!("Failed to initialize touch controller: {:?}", e);
+            // Continue without touch support
+        }
+    }
 
     info!("Display initialized, setting up dual-core rendering...");
 
@@ -683,10 +741,14 @@ async fn main(spawner: Spawner) {
     info!("Spawning automatic WiFi refresh task on Core 0");
     spawner.spawn(auto_wifi_refresh_task(ui_for_refresh)).ok();
 
-    // **Core 0**: Spawn Slint rendering task
+    // **Core 0**: Spawn Slint rendering task with touch support
     info!("Spawning Slint rendering task on Core 0");
     spawner
-        .spawn(slint_rendering_task(window.clone(), ui.as_weak()))
+        .spawn(slint_rendering_task(
+            window.clone(),
+            ui.as_weak(),
+            graphics_touch_controller,
+        ))
         .ok();
 
     // Show the window
