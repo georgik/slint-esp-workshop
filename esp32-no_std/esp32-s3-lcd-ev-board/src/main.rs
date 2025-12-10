@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec;
 use core::panic::PanicInfo;
-use log::{error, info};
+use log::{debug, error, info};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -64,8 +64,10 @@ use esp_hal::lcd_cam::{
 };
 
 // Slint platform imports
+use slint::PhysicalPosition;
 use slint::PhysicalSize;
 use slint::platform::software_renderer::Rgb565Pixel;
+use slint::platform::{PointerEventButton, WindowEvent};
 
 slint::include_modules!();
 
@@ -598,6 +600,13 @@ async fn main(spawner: embassy_executor::Spawner) {
     }
     drop(vsync_guard);
 
+    // Get I2C bus back from expander for touch controller
+    let i2c = expander.into_i2c();
+    info!("Retrieved I2C bus from expander for touch controller");
+
+    // Store I2C bus for touch controller (will be initialized after window creation)
+    let touch_i2c = i2c;
+
     // Set up DMA channel for LCD
     let tx_channel = peripherals.DMA_CH2;
     let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
@@ -720,6 +729,27 @@ async fn main(spawner: embassy_executor::Spawner) {
     slint::platform::set_platform(backend).expect("backend already initialized");
     info!("Custom Slint backend initialized");
 
+    // Initialize FT5x06 touch controller using address 0x38 (from ESP BSP)
+    let mut touch_controller = Ft5x06::new(touch_i2c, 0x38);
+    info!("FT5x06 touch controller initialized with I2C address 0x38");
+
+    // Test touch polling once to verify it's working
+    info!("Testing touch controller polling...");
+    match touch_controller.get_touch() {
+        Ok(touch_result) => match touch_result {
+            Some((x, y)) => {
+                info!("Touch controller test: Touch detected at x={}, y={}", x, y);
+            }
+            None => {
+                info!("Touch controller test: No touch detected");
+            }
+        },
+        Err(e) => {
+            info!("Touch controller test: Error reading touch: {:?}", e);
+        }
+    }
+    info!("Touch controller test completed - polling functionality verified");
+
     // Create the UI
     let ui = MainWindow::new().unwrap();
 
@@ -812,14 +842,112 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     info!("=== All systems initialized, entering main loop ===");
 
-    // Simple main loop to keep the Embassy executor alive (matching ESoPe pattern)
-    let mut ticker = Ticker::every(Duration::from_secs(1));
-    loop {
-        ticker.next().await;
+    // === Touch Polling Integration ===
+    info!("Starting continuous touch polling and Slint integration...");
 
-        // Check for WiFi updates periodically
-        if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
-            info!("WiFi scan results available for UI update");
+    let mut status_counter = 0u32;
+    let mut touch_ticker = Ticker::every(Duration::from_millis(16)); // ~60Hz touch polling
+    let mut last_touch_state: Option<(u16, u16)> = None;
+    let mut last_touch_position = slint::LogicalPosition::new(0.0, 0.0);
+
+    loop {
+        // Poll touch events from FT5x06 touch controller
+        match touch_controller.get_touch() {
+            Ok(touch_result) => {
+                match (last_touch_state.as_ref(), touch_result) {
+                    // Touch press event (transition from None to Some)
+                    (None, Some((x, y))) => {
+                        let physical_position = PhysicalPosition::new(x as i32, y as i32);
+                        let logical_position = physical_position.to_logical(window.scale_factor());
+                        last_touch_position = logical_position;
+
+                        let pointer_event = WindowEvent::PointerPressed {
+                            position: logical_position,
+                            button: PointerEventButton::Left,
+                        };
+
+                        window.dispatch_event(pointer_event);
+                        info!(
+                            "Touch PRESSED at x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
+                            x,
+                            y,
+                            logical_position.x,
+                            logical_position.y,
+                            window.scale_factor()
+                        );
+                    }
+                    // Touch release event (transition from Some to None)
+                    (Some(_), None) => {
+                        // Send PointerReleased at the last known position
+                        let pointer_released = WindowEvent::PointerReleased {
+                            position: last_touch_position,
+                            button: PointerEventButton::Left,
+                        };
+                        window.dispatch_event(pointer_released);
+
+                        // Also send PointerExited to complete the interaction cycle
+                        let pointer_exited = WindowEvent::PointerExited;
+                        window.dispatch_event(pointer_exited);
+
+                        info!(
+                            "Touch RELEASED at (logical: {:.1}, {:.1}) + EXITED",
+                            last_touch_position.x, last_touch_position.y
+                        );
+                    }
+                    // Touch move event (both states are Some but potentially different positions)
+                    (Some((old_x, old_y)), Some((new_x, new_y))) => {
+                        // Only dispatch move event if position actually changed
+                        if *old_x != new_x || *old_y != new_y {
+                            let physical_position =
+                                PhysicalPosition::new(new_x as i32, new_y as i32);
+                            let logical_position =
+                                physical_position.to_logical(window.scale_factor());
+                            last_touch_position = logical_position;
+
+                            let pointer_event = WindowEvent::PointerMoved {
+                                position: logical_position,
+                            };
+
+                            window.dispatch_event(pointer_event);
+                            debug!(
+                                "Touch MOVED to x={}, y={} (logical: {:.1}, {:.1}, scale_factor={})",
+                                new_x,
+                                new_y,
+                                logical_position.x,
+                                logical_position.y,
+                                window.scale_factor()
+                            );
+                        }
+                    }
+                    // No state change
+                    _ => {}
+                }
+
+                last_touch_state = touch_result;
+            }
+            Err(e) => {
+                // Touch polling error - don't spam logs, just continue
+                debug!("Touch polling error: {:?}", e);
+            }
         }
+
+        // Status logging and WiFi updates (less frequent than touch polling)
+        if status_counter % 60 == 0 {
+            // Every ~1 second at 60Hz
+            if WIFI_SCAN_UPDATED.load(Ordering::Relaxed) {
+                info!("WiFi scan results available for UI update");
+            }
+        }
+
+        if status_counter % 600 == 0 {
+            // Every ~10 seconds at 60Hz
+            info!(
+                "Main task status check #{} - ESP32-S3-LCD-EV-Board alive with touch polling",
+                status_counter / 60
+            );
+        }
+
+        status_counter += 1;
+        touch_ticker.next().await;
     }
 }
