@@ -13,14 +13,14 @@ use alloc::vec;
 use core::panic::PanicInfo;
 use log::{debug, error, info};
 
-// WiFi imports - simplified
+// WiFi imports - using esp-radio
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Ticker};
-use esp_hal::rng::Rng;
-use esp_wifi::EspWifiController;
-use esp_wifi::wifi::{AccessPointInfo, ClientConfiguration, Configuration, WifiController};
+use esp_radio::wifi::{
+    AccessPointInfo, ClientConfig, Config, ModeConfig, ScanConfig, WifiController,
+};
 
 // ESP32 HAL imports - only what we need
 use esp_alloc as _;
@@ -30,6 +30,29 @@ use esp_hal::i2c::master::I2c;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::logger::init_logger_from_env;
+
+// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
+
+// Heap statistics function
+fn report_heap_stats(context: &str) {
+    let used = esp_alloc::HEAP.used();
+    let free = esp_alloc::HEAP.free();
+    info!(
+        "[HEAP STATS] {}: Used: {} bytes, Free: {} bytes, Total: {} bytes",
+        context,
+        used,
+        free,
+        used + free
+    );
+}
 
 // Display imports
 use display::{DISPLAY_COMPONENTS, HardwareDrawBuffer};
@@ -350,14 +373,15 @@ async fn graphics_task(
 async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     info!("=== WiFi scan task started ====");
 
-    // Start WiFi
-    let client_config = Configuration::Client(ClientConfiguration {
-        ssid: String::new(),
-        password: String::new(),
-        ..Default::default()
-    });
+    // Check WiFi capabilities
+    info!("WiFi capabilities: {:?}", wifi_controller.capabilities());
 
-    match wifi_controller.set_configuration(&client_config) {
+    // Report heap statistics after WiFi scanning task starts
+    report_heap_stats("After WiFi scanning task spawn");
+
+    // Configure WiFi as Client (following working pattern from esope-sld-c-w-s3)
+    let client_config = ModeConfig::Client(ClientConfig::default());
+    match wifi_controller.set_config(&client_config) {
         Ok(_) => info!("WiFi configuration set successfully"),
         Err(e) => info!("Failed to set WiFi configuration: {:?}", e),
     }
@@ -373,7 +397,10 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     loop {
         info!("Performing WiFi scan...");
 
-        match wifi_controller.scan_n_async(10).await {
+        match wifi_controller
+            .scan_with_config_async(ScanConfig::default().with_max(10))
+            .await
+        {
             Ok(results) => {
                 info!("Found {} networks:", results.len());
                 for (i, ap) in results.iter().enumerate() {
@@ -407,23 +434,51 @@ async fn wifi_scan_task(mut wifi_controller: WifiController<'static>) {
     }
 }
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
     // Initialize peripherals first
-    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
 
-    // Initialize BOTH heap allocators - WiFi first in internal RAM, then PSRAM for GUI
-    // Step 1: Initialize internal RAM heap for WiFi (must be first)
-    esp_alloc::heap_allocator!(size: 180 * 1024);
+    // Initialize IRAM heap for WiFi and small allocations
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 70 * 1024);
+    esp_alloc::heap_allocator!(size: 90 * 1024);
 
-    // Step 2: Initialize PSRAM heap for GUI and other data
-    init_heap(&peripherals.PSRAM);
+    // Initialize PSRAM heap for large allocations like framebuffer using esp-hal 1.0.0 macro
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    info!("PSRAM heap initialized using psram_allocator! macro");
 
     // Initialize logger
     init_logger_from_env();
     info!("Peripherals initialized");
 
+    // Report initial heap statistics
+    report_heap_stats("After heap initialization");
+
     info!("Starting Slint ESP32 M5Stack CoreS3 Workshop");
+
+    // Initialize embassy timer for task scheduling BEFORE spawning tasks
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    // For ESP32-S3 (Xtensa), we don't need the software interrupt parameter
+    esp_rtos::start(timg0.timer0);
+    info!("esp-rtos timer initialized");
+
+    // Initialize WiFi using new esp-radio API FIRST (before framebuffer allocation)
+    info!("Initializing WiFi...");
+    let radio_init = mk_static!(
+        esp_radio::Controller<'static>,
+        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
+    );
+    let (wifi_controller, interfaces) =
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Config::default())
+            .expect("Failed to initialize Wi-Fi controller");
+
+    // Extract the station interface for WiFi operations
+    let _wifi_interface = interfaces.sta;
+    info!("WiFi controller initialized with station interface");
+
+    // Report heap statistics after WiFi initialization
+    report_heap_stats("After WiFi initialization");
 
     // === Begin M5Stack CoreS3 Power Management and I2C Initialization ===
     // Initialize I2C bus for all I2C devices (AXP2101, AW9523, touch controller)
@@ -468,27 +523,6 @@ async fn main(spawner: embassy_executor::Spawner) {
     delay.delay_ms(100);
     info!("Power management initialization complete, power rails stabilized");
     // === End M5Stack CoreS3 Power Management Initialization ===
-
-    // Initialize WiFi directly in main function
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let rng = Rng::new(peripherals.RNG);
-
-    info!("Initializing WiFi...");
-    let esp_wifi_ctrl = &*mk_static!(
-        EspWifiController<'static>,
-        esp_wifi::init(timg0.timer0, rng.clone()).expect("Failed to initialize WiFi")
-    );
-    info!("WiFi controller initialized");
-
-    let (wifi_controller, _interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI)
-        .expect("Failed to create WiFi interface");
-    info!("WiFi interface created");
-
-    // Initialize embassy timer for task scheduling BEFORE spawning tasks
-    use esp_hal::timer::systimer::SystemTimer;
-    let systimer = SystemTimer::new(peripherals.SYSTIMER);
-    esp_hal_embassy::init(systimer.alarm0);
-    info!("Embassy timer initialized");
 
     // Store WiFi controller for the wifi scan task
     let wifi_ctrl = wifi_controller;
