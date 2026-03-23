@@ -5,6 +5,7 @@
 use alloc::boxed::Box;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
+use embedded_graphics_core::pixelcolor::raw::RawU16;
 use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::gpio::DriveMode;
@@ -65,7 +66,7 @@ pub struct DisplayHardware {
             ExclusiveDevice<Spi<'static, esp_hal::Blocking>, Output<'static>, Delay>,
             Output<'static>,
         >,
-        mipidsi::models::ILI9486Rgb565,
+        mipidsi::models::ILI9341Rgb565,
         Output<'static>,
     >,
     pub touch: Gt911Blocking<I2c<'static, esp_hal::Blocking>>,
@@ -140,6 +141,9 @@ pub fn init_display_hardware(
     delay.delay_ms(50);
     // --- End GT911 I²C Address Selection Sequence ---
 
+    // Store the configured reset pin level for display use
+    let _rst_for_display = rst;
+
     // SPI and Display initialization following working reference
     let spi = Spi::<Blocking>::new(
         spi2,
@@ -166,14 +170,30 @@ pub fn init_display_hardware(
     let mut display_delay = Delay::new();
     display_delay.delay_ns(500_000u32);
 
-    let mut display = mipidsi::Builder::new(mipidsi::models::ILI9486Rgb565, di)
-        .reset_pin(rst)
+    let mut display = match mipidsi::Builder::new(mipidsi::models::ILI9341Rgb565, di)
+        .reset_pin(_rst_for_display)
         .orientation(
             mipidsi::options::Orientation::new().rotate(mipidsi::options::Rotation::Deg180),
         )
         .color_order(ColorOrder::Bgr)
         .init(&mut display_delay)
-        .map_err(|_| "Failed to initialize display")?;
+    {
+        Ok(display) => display,
+        Err(e) => {
+            let error_msg = match e {
+                mipidsi::InitError::Interface(e) => {
+                    alloc::format!("Display interface error: {:?}", e)
+                }
+                mipidsi::InitError::ResetPin(e) => {
+                    alloc::format!("Display reset pin error: {:?}", e)
+                }
+                mipidsi::InitError::InvalidConfiguration(e) => {
+                    alloc::format!("Display configuration error: {:?}", e)
+                }
+            };
+            return Err(alloc::boxed::Box::leak(error_msg.into_boxed_str()) as &str);
+        }
+    };
 
     // Set up the backlight
     let mut backlight = Output::new(gpio47, Level::Low, OutputConfig::default());
@@ -220,7 +240,7 @@ impl<
     DI: mipidsi::interface::Interface<Word = u8>,
     RST: embedded_hal::digital::OutputPin<Error = core::convert::Infallible>,
 > slint::platform::software_renderer::LineBufferProvider
-    for &mut DrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9486Rgb565, RST>>
+    for &mut DrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9341Rgb565, RST>>
 {
     type TargetPixel = slint::platform::software_renderer::Rgb565Pixel;
 
@@ -240,9 +260,7 @@ impl<
                 line as u16,
                 range.end as u16,
                 line as u16,
-                buffer
-                    .iter()
-                    .map(|x| embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()),
+                buffer.iter().map(|x| Rgb565::from(RawU16::new(x.0))),
             )
             .unwrap();
     }
@@ -267,7 +285,7 @@ impl<
     DI: mipidsi::interface::Interface<Word = u8>,
     RST: embedded_hal::digital::OutputPin<Error = core::convert::Infallible>,
 > slint::platform::software_renderer::LineBufferProvider
-    for &mut HardwareDrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9486Rgb565, RST>>
+    for &mut HardwareDrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9341Rgb565, RST>>
 {
     type TargetPixel = slint::platform::software_renderer::Rgb565Pixel;
 
@@ -287,9 +305,7 @@ impl<
                 line as u16,
                 range.end as u16,
                 line as u16,
-                buffer
-                    .iter()
-                    .map(|x| embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()),
+                buffer.iter().map(|x| Rgb565::from(RawU16::new(x.0))),
             )
             .unwrap();
     }
