@@ -19,7 +19,7 @@ slint = { version = "1.15.1", default-features = false, features = [
 embedded-graphics = "0.8.2"
 embedded-graphics-core = "0.4"
 embedded-hal = "1.0.0"
-embedded-hal-bus = "0.2"
+embedded-hal-bus = "0.3"
 mipidsi = "0.9.0"
 display-interface = "0.5.0"
 esp-println = { version = "0.15.0", features = ["esp32s3", "log-04"] }
@@ -36,7 +36,7 @@ esp-hal = { version = "1.0.0", features = ["esp32s3", "unstable", "psram"] }
 esp-alloc = "0.9.0"
 esp-backtrace = { version = "0.17.0", features = ["esp32s3", "println"] }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
-heapless = { version = "0.8.0", default-features = false }
+heapless = { version = "0.9.2", default-features = false }
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 smoltcp = { version = "0.12.0", default-features = false, features = [
