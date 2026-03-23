@@ -8,7 +8,7 @@ rust-version = "1.88"
 [dependencies]
 log = { version = "0.4", default-features = false }
 
-slint = { version = "1.12.1", default-features = false, features = [
+slint = { version = "1.15.1", default-features = false, features = [
     "compat-1-2",
     "unsafe-single-threaded",
     "libm",
@@ -16,7 +16,7 @@ slint = { version = "1.12.1", default-features = false, features = [
 ] }
 
 # ESP32-S3-Box-3 display and touch dependencies  
-embedded-graphics = "0.8.1"
+embedded-graphics = "0.8.2"
 embedded-graphics-core = "0.4"
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.2"
@@ -27,8 +27,8 @@ esp-println = { version = "0.15.0", features = ["esp32s3", "log-04"] }
 # Updated to match workshop versions with WiFi support
 critical-section = "1.2.0"
 embassy-executor = { version = "0.9.1", features = ["executor-thread"] }
-embassy-time = "0.5.0"
-embassy-sync = { version = "0.7.0", default-features = false }
+embassy-time = "0.5.1"
+embassy-sync = { version = "0.7.2", default-features = false }
 static_cell = "2.1.1"
 esp-radio = { version = "0.17.0", features = ["esp32s3", "wifi"] }
 esp-rtos = { version = "0.2.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3"] }
@@ -66,4 +66,4 @@ opt-level        = 's'
 overflow-checks  = false
 
 [build-dependencies]
-slint-build = { version = "1.12.1", features = ["sdf-fonts"] }
+slint-build = { version = "1.15.1", features = ["sdf-fonts"] }

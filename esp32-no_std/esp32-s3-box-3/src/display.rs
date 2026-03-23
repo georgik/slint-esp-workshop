@@ -18,7 +18,7 @@ use esp_hal::{
     time::Rate,
 };
 use gt911::Gt911Blocking;
-use log::{error, info, warn};
+use log::info;
 use mipidsi::options::ColorOrder;
 
 // Global storage for display components - using a safer approach
@@ -185,7 +185,7 @@ pub fn init_display_hardware(
         .map_err(|_| "Failed to clear display")?;
 
     // I2C initialization for touch
-    let mut i2c = I2c::new(
+    let i2c = I2c::new(
         i2c0,
         esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
     )
@@ -196,7 +196,7 @@ pub fn init_display_hardware(
     // TODO: Fix touch initialization - it's blocking the application
     // Temporarily disabled to test WiFi functionality
     info!("Touch initialization temporarily disabled to prevent blocking");
-    let mut touch = Gt911Blocking::new(0x5D); // Use backup address directly
+    let touch = Gt911Blocking::new(0x5D); // Use backup address directly
     info!("Touch controller created (not initialized)");
 
     // Store components globally for the platform to use

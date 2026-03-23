@@ -141,7 +141,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
-    let (mut wifi_controller, interfaces) =
+    let (wifi_controller, interfaces) =
         esp_radio::wifi::new(radio_init, peripherals.WIFI, Config::default())
             .expect("Failed to initialize Wi-Fi controller");
 
