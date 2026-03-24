@@ -10,7 +10,6 @@ mod touch;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::string::String;
 use alloc::vec;
 use core::panic::PanicInfo;
 use log::{debug, error, info};
@@ -95,31 +94,6 @@ const AW9523_I2C_ADDRESS: u8 = 0x58; // AW9523 GPIO expander
 fn panic(info: &PanicInfo) -> ! {
     error!("PANIC: {}", info);
     loop {}
-}
-
-// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
-
-fn init_heap(psram: &esp_hal::peripherals::PSRAM<'_>) {
-    let (start, size) = esp_hal::psram::psram_raw_parts(psram);
-    info!(
-        "Initializing PSRAM heap: start: {:p}, size: {}",
-        start, size
-    );
-    unsafe {
-        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-            start,
-            size,
-            esp_alloc::MemoryCapability::External.into(),
-        ));
-    }
 }
 
 /// Initialize the AXP2101 power management unit for M5Stack CoreS3
@@ -681,7 +655,6 @@ async fn main(spawner: embassy_executor::Spawner) {
     let mut status_counter = 0u32;
     let mut touch_ticker = Ticker::every(Duration::from_millis(16)); // ~60Hz touch polling
     let mut last_touch_state = TouchState::Released;
-    let mut last_touch_position = slint::LogicalPosition::new(0.0, 0.0);
 
     loop {
         // Poll touch events if touch controller is available
@@ -695,7 +668,6 @@ async fn main(spawner: embassy_executor::Spawner) {
                                 PhysicalPosition::new(touch_point.x as i32, touch_point.y as i32);
                             let logical_position =
                                 physical_position.to_logical(window.scale_factor());
-                            last_touch_position = logical_position;
 
                             let pointer_event = WindowEvent::PointerPressed {
                                 position: logical_position,
@@ -747,7 +719,6 @@ async fn main(spawner: embassy_executor::Spawner) {
                                     PhysicalPosition::new(new_point.x as i32, new_point.y as i32);
                                 let logical_position =
                                     physical_position.to_logical(window.scale_factor());
-                                last_touch_position = logical_position;
 
                                 let pointer_event = WindowEvent::PointerMoved {
                                     position: logical_position,
