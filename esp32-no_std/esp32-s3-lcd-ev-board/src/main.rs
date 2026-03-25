@@ -629,14 +629,14 @@ async fn main(spawner: embassy_executor::Spawner) {
     info!("Starting Slint ESP32-S3-LCD-EV-Board Workshop");
 
     // Setup I2C for the TCA9554 IO expander and FT5x06 touch controller
-    // Using STANDARD module pin mapping: SDA=GPIO8, SCL=GPIO18
+    // Using R16 module pin mapping (latest LCD EV kit): SDA=GPIO47, SCL=GPIO48
     let i2c = esp_hal::i2c::master::I2c::new(
         peripherals.I2C0,
         esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
     )
     .unwrap()
-    .with_sda(peripherals.GPIO8)
-    .with_scl(peripherals.GPIO18);
+    .with_sda(peripherals.GPIO47)
+    .with_scl(peripherals.GPIO48);
 
     // Initialize the IO expander for controlling the display
     let mut expander = Tca9554::new(i2c);
@@ -714,13 +714,13 @@ async fn main(spawner: embassy_executor::Spawner) {
     let tx_channel = peripherals.DMA_CH2;
     let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
 
-    // Configure the RGB display
+    // Configure the RGB display - Using official BSP timing for GC9503
     let config = DpiConfig::default()
         .with_clock_mode(ClockMode {
             polarity: Polarity::IdleLow,
             phase: Phase::ShiftLow,
         })
-        .with_frequency(Rate::from_mhz(20))
+        .with_frequency(Rate::from_mhz(16))
         .with_format(Format {
             enable_2byte_mode: true,
             ..Default::default()
@@ -728,12 +728,12 @@ async fn main(spawner: embassy_executor::Spawner) {
         .with_timing(FrameTiming {
             horizontal_active_width: LCD_H_RES as usize,
             vertical_active_height: LCD_V_RES as usize,
-            horizontal_total_width: 600,
-            horizontal_blank_front_porch: 80,
-            vertical_total_height: 600,
-            vertical_blank_front_porch: 80,
+            horizontal_total_width: 520,
+            horizontal_blank_front_porch: 20,
+            vertical_total_height: 510,
+            vertical_blank_front_porch: 10,
             hsync_width: 10,
-            vsync_width: 4,
+            vsync_width: 10,
             hsync_position: 10,
         })
         .with_vsync_idle_level(Level::High)
@@ -753,8 +753,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         .with_data3(peripherals.GPIO13)
         .with_data4(peripherals.GPIO14)
         .with_data5(peripherals.GPIO21)
-        .with_data6(peripherals.GPIO47)
-        .with_data7(peripherals.GPIO48)
+        .with_data6(peripherals.GPIO8)
+        .with_data7(peripherals.GPIO18)
         .with_data8(peripherals.GPIO45)
         .with_data9(peripherals.GPIO38)
         .with_data10(peripherals.GPIO39)
@@ -910,15 +910,27 @@ async fn main(spawner: embassy_executor::Spawner) {
         Box::new([Rgb565Pixel(0); LCD_BUFFER_SIZE]);
 
     // Create test pattern first to verify display works
+    // Use solid colors to test - red in top-left, green in top-right, blue in bottom-left
     for i in 0..LCD_BUFFER_SIZE {
         let x = i % LCD_H_RES_USIZE;
         let y = i / LCD_H_RES_USIZE;
-        // Create a simple test pattern - gradient from green to blue
-        let g = (x * 31 / LCD_H_RES_USIZE) as u8;
-        let b = (y * 31 / LCD_V_RES_USIZE) as u8;
-        fb_box[i] = Rgb565Pixel(((g as u16) << 11) | ((b as u16) << 0));
+
+        // RGB565 format: RRRRRGGGGGGBBBBB
+        // Red: bits 15-11, Green: bits 10-5, Blue: bits 4-0
+        let color = if x < LCD_H_RES_USIZE / 2 && y < LCD_V_RES_USIZE / 2 {
+            // Top-left: Red (0b11111_000000_00000 = 0xF800)
+            0xF800
+        } else if x >= LCD_H_RES_USIZE / 2 && y < LCD_V_RES_USIZE / 2 {
+            // Top-right: Green (0b00000_111111_00000 = 0x07E0)
+            0x07E0
+        } else {
+            // Bottom: Blue (0b00000_000000_11111 = 0x001F)
+            0x001F
+        };
+
+        fb_box[i] = Rgb565Pixel(color);
     }
-    info!("Test pattern written to framebuffer");
+    info!("Test pattern written to framebuffer - Red/Green/Blue quadrants");
 
     let fb_ptr: *mut Rgb565Pixel = fb_box.as_mut_ptr();
     let psram_buf: &'static mut [u8] =
@@ -940,15 +952,27 @@ async fn main(spawner: embassy_executor::Spawner) {
         PSRAM_BUF_LEN = psram_buf.len();
     }
 
-    // Configure DMA buffer with proper burst configuration
-    let dma_tx: DmaTxBuf = unsafe {
-        DmaTxBuf::new_with_config(
-            &mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS),
-            psram_buf,
-            ExternalBurstConfig::Size64,
-        )
-        .unwrap()
-    };
+    // Configure DMA buffer - matching working example
+    let mut dma_tx: DmaTxBuf =
+        unsafe { DmaTxBuf::new(&mut *core::ptr::addr_of_mut!(TX_DESCRIPTORS), psram_buf).unwrap() };
+
+    // **CRITICAL**: Do initial DMA transfer with test pattern before starting tasks
+    // This ensures the display shows something immediately
+    info!("Starting initial DMA transfer with test pattern...");
+    dma_tx.set_length(FRAME_BYTES);
+    match dpi.send(false, dma_tx) {
+        Ok(xfer) => {
+            let (_res, dpi2, tx2) = xfer.wait();
+            dpi = dpi2;
+            dma_tx = tx2;
+            info!("Initial DMA transfer completed successfully");
+        }
+        Err((e, dpi2, tx2)) => {
+            error!("Initial DMA transfer failed: {:?}", e);
+            dpi = dpi2;
+            dma_tx = tx2;
+        }
+    }
 
     // Split peripherals for multicore usage
     let (dpi_for_display, _) = (dpi, ());
